@@ -61,8 +61,12 @@ type SubscribeFile = {
   template_filename: string
   selected_tags: string[]
   selected_node_ids?: number[]
+  selected_provider_names?: string[]
   custom_short_code?: string
   raw_output: boolean
+  normal_link_enabled?: boolean
+  provider_link_enabled?: boolean
+  default_output_mode?: 'normal' | 'provider'
   traffic_limit?: number | null
   stats_server_ids: string
   expire_at?: string | null
@@ -103,6 +107,7 @@ type ProxyProviderConfig = {
   id: number
   external_subscription_id: number
   name: string
+  remark: string
   type: string
   interval: number
   proxy: string
@@ -364,6 +369,11 @@ function SubscribeFilesPage() {
     template_filename: '',
     selected_tags: [] as string[],
     selected_node_ids: [] as number[],
+    selected_provider_names: [] as string[],
+    raw_output: false,
+    normal_link_enabled: true,
+    provider_link_enabled: false,
+    default_output_mode: 'normal' as 'normal' | 'provider',
     expire: undefined as Date | undefined,
     traffic_limit: '' as string,
     stats_server_ids: '' as string,
@@ -389,6 +399,7 @@ function SubscribeFilesPage() {
   const [selectedExternalSub, setSelectedExternalSub] = useState<ExternalSubscription | null>(null)
   const [proxyProviderForm, setProxyProviderForm] = useState({
     name: '',
+    remark: '',
     type: 'http',
     interval: 3600,
     proxy: 'DIRECT',
@@ -522,6 +533,10 @@ function SubscribeFilesPage() {
     enabled: Boolean(auth.accessToken && enableProxyProvider),
   })
   const proxyProviderConfigs = proxyProviderConfigsData ?? []
+  const clientProxyProviderConfigs = useMemo(
+    () => proxyProviderConfigs.filter(c => !c.process_mode || c.process_mode === 'client'),
+    [proxyProviderConfigs]
+  )
 
   // 获取探针服务器列表（用于统计服务器选择）
   const { data: probeConfigData } = useQuery({
@@ -715,7 +730,7 @@ function SubscribeFilesPage() {
       toast.success('订阅信息已更新')
       setEditMetadataDialogOpen(false)
       setEditingMetadata(null)
-      setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], selected_node_ids: [], expire: undefined, traffic_limit: '', stats_server_ids: '' })
+      setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.error || '更新失败')
@@ -825,6 +840,7 @@ function SubscribeFilesPage() {
     mutationFn: async (data: {
       external_subscription_id: number
       name: string
+      remark: string
       type: string
       interval: number
       proxy: string
@@ -860,6 +876,7 @@ function SubscribeFilesPage() {
       // 重置表单
       setProxyProviderForm({
         name: '',
+        remark: '',
         type: 'http',
         interval: 3600,
         proxy: 'DIRECT',
@@ -889,6 +906,7 @@ function SubscribeFilesPage() {
     mutationFn: async (data: {
       id: number
       name: string
+      remark: string
       type: string
       interval: number
       proxy: string
@@ -1604,6 +1622,8 @@ function SubscribeFilesPage() {
     setEditingMetadata(file)
     const nodeIDs = file.selected_node_ids || []
     const tags = file.selected_tags || []
+    const providerEnabled = file.provider_link_enabled ?? false
+    const normalEnabled = file.normal_link_enabled ?? !providerEnabled
     setMetadataForm({
       name: file.name,
       description: file.description,
@@ -1611,6 +1631,12 @@ function SubscribeFilesPage() {
       template_filename: file.template_filename || '',
       selected_tags: tags,
       selected_node_ids: nodeIDs,
+      selected_provider_names: file.selected_provider_names || [],
+      // raw_output is true raw file only (no template); never the old provider flag
+      raw_output: !!file.raw_output && !file.template_filename,
+      normal_link_enabled: normalEnabled,
+      provider_link_enabled: providerEnabled,
+      default_output_mode: (file.default_output_mode === 'provider' ? 'provider' : 'normal'),
       expire: file.expire_at ? new Date(file.expire_at) : undefined,
       traffic_limit: file.traffic_limit != null ? String(file.traffic_limit) : '',
       stats_server_ids: file.stats_server_ids || '',
@@ -1630,6 +1656,25 @@ function SubscribeFilesPage() {
       toast.error('请填写文件名')
       return
     }
+    if (!metadataForm.normal_link_enabled && !metadataForm.provider_link_enabled) {
+      toast.error('至少启用一种输出模式（普通链接或 Provider 链接）')
+      return
+    }
+    if (metadataForm.provider_link_enabled && !metadataForm.template_filename) {
+      toast.error('启用 Provider 链接时必须绑定 v3 模板')
+      return
+    }
+    if (metadataForm.provider_link_enabled && clientProxyProviderConfigs.length === 0) {
+      toast.error('启用 Provider 链接时需要至少一个可用的 client provider')
+      return
+    }
+    let defaultMode = metadataForm.default_output_mode
+    if (defaultMode === 'provider' && !metadataForm.provider_link_enabled) {
+      defaultMode = 'normal'
+    }
+    if (defaultMode === 'normal' && !metadataForm.normal_link_enabled) {
+      defaultMode = 'provider'
+    }
     updateMetadataMutation.mutate({
       id: editingMetadata.id,
       data: {
@@ -1637,9 +1682,14 @@ function SubscribeFilesPage() {
         description: metadataForm.description,
         filename: metadataForm.filename,
         template_filename: metadataForm.template_filename || null,
-        // 节点 mode → 提交 node_ids 清空 tags;tag mode → 反之
+        // 普通/Provider 配置独立保存，切换模式不清空另一套
         selected_tags: pickerMode === 'node' ? [] : metadataForm.selected_tags,
         selected_node_ids: pickerMode === 'node' ? metadataForm.selected_node_ids : [],
+        selected_provider_names: metadataForm.selected_provider_names,
+        raw_output: metadataForm.raw_output && !metadataForm.template_filename,
+        normal_link_enabled: metadataForm.normal_link_enabled,
+        provider_link_enabled: metadataForm.provider_link_enabled,
+        default_output_mode: defaultMode,
         expire_at: metadataForm.expire
           ? (() => {
               const endOfDay = new Date(metadataForm.expire)
@@ -3619,6 +3669,16 @@ function SubscribeFilesPage() {
                             原始输出
                           </Badge>
                         )}
+                        {file.provider_link_enabled && (
+                          <Badge variant='outline' className='bg-sky-500/10 text-sky-700 dark:text-sky-400'>
+                            Provider
+                          </Badge>
+                        )}
+                        {file.normal_link_enabled && file.provider_link_enabled && (
+                          <Badge variant='outline' className='bg-violet-500/10 text-violet-700 dark:text-violet-400'>
+                            双模式
+                          </Badge>
+                        )}
                         <div className='font-medium text-sm truncate'>{file.name}</div>
                       </div>
                       <AlertDialog>
@@ -4543,6 +4603,7 @@ function SubscribeFilesPage() {
                         setSelectedExternalSub(null)
                         setProxyProviderForm({
                           name: '',
+                          remark: '',
                           type: 'http',
                           interval: 3600,
                           proxy: 'DIRECT',
@@ -4658,6 +4719,15 @@ function SubscribeFilesPage() {
                         )
                       },
                       {
+                        key: 'remark',
+                        header: '备注',
+                        cell: (config) => (
+                          <div className='text-xs text-muted-foreground max-w-[180px] truncate' title={config.remark || ''}>
+                            {config.remark || '-'}
+                          </div>
+                        )
+                      },
+                      {
                         key: 'external_subscription',
                         header: '关联订阅',
                         cell: (config) => {
@@ -4762,6 +4832,7 @@ function SubscribeFilesPage() {
                                     }
                                     setProxyProviderForm({
                                       name: config.name,
+                                      remark: config.remark || '',
                                       type: config.type,
                                       interval: config.interval,
                                       proxy: config.proxy,
@@ -4984,6 +5055,7 @@ function SubscribeFilesPage() {
                                 }
                                 setProxyProviderForm({
                                   name: config.name,
+                                  remark: config.remark || '',
                                   type: config.type,
                                   interval: config.interval,
                                   proxy: config.proxy,
@@ -5043,6 +5115,10 @@ function SubscribeFilesPage() {
                             const sub = externalSubs.find(s => s.id === config.external_subscription_id)
                             return sub?.name || '未知'
                           }
+                        },
+                        {
+                          label: '备注',
+                          value: (config) => config.remark || '-'
                         },
                         {
                           label: '过滤规则',
@@ -5141,7 +5217,7 @@ function SubscribeFilesPage() {
         setEditMetadataDialogOpen(open)
         if (!open) {
           setEditingMetadata(null)
-          setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], expire: undefined, traffic_limit: '', stats_server_ids: '' })
+          setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
         }
       }}>
         <DialogContent className='sm:max-w-lg max-h-[90vh] flex flex-col'>
@@ -5236,7 +5312,13 @@ function SubscribeFilesPage() {
                         "justify-start h-9",
                         !metadataForm.template_filename && "bg-accent"
                       )}
-                      onClick={() => setMetadataForm({ ...metadataForm, template_filename: '' })}
+                      onClick={() => {
+                        if (metadataForm.provider_link_enabled) {
+                          toast.error('请先关闭 Provider 链接，再取消绑定模板')
+                          return
+                        }
+                        setMetadataForm({ ...metadataForm, template_filename: '' })
+                      }}
                     >
                       {!metadataForm.template_filename && <Check className="h-4 w-4 mr-2" />}
                       <span className={!metadataForm.template_filename ? '' : 'ml-6'}>不绑定模板</span>
@@ -5263,8 +5345,152 @@ function SubscribeFilesPage() {
                 绑定模板后，获取订阅时将根据模板动态生成配置。绑定模板会自动禁用覆写开关。
               </p>
             </div>
-            {/* 节点选择(绑定模板时显示):新模式 node mode(按 tag 分组列节点),老模式 tag mode(按标签筛) */}
             {metadataForm.template_filename && (
+              <div className='space-y-3 rounded-lg border p-3'>
+                <div className='space-y-0.5'>
+                  <Label>输出模式</Label>
+                  <p className='text-xs text-muted-foreground'>
+                    普通链接与 Provider 链接可同时启用；两套节点/Provider 配置独立保存，切换不会清空另一侧。
+                  </p>
+                </div>
+                <div className='flex items-center justify-between gap-2'>
+                  <div className='space-y-0.5'>
+                    <div className='text-sm font-medium'>启用普通链接</div>
+                    <p className='text-xs text-muted-foreground'>按节点/标签生成完整 proxies 配置</p>
+                  </div>
+                  <Switch
+                    checked={metadataForm.normal_link_enabled}
+                    onCheckedChange={(checked) => {
+                      const next = {
+                        ...metadataForm,
+                        normal_link_enabled: !!checked,
+                      }
+                      if (!checked && next.default_output_mode === 'normal') {
+                        next.default_output_mode = next.provider_link_enabled ? 'provider' : 'normal'
+                      }
+                      setMetadataForm(next)
+                    }}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-2'>
+                  <div className='space-y-0.5'>
+                    <div className='text-sm font-medium'>启用 Provider 链接</div>
+                    <p className='text-xs text-muted-foreground'>保留 Mihomo 原生 proxy-providers 与 use</p>
+                  </div>
+                  <Switch
+                    checked={metadataForm.provider_link_enabled}
+                    onCheckedChange={(checked) => {
+                      const next = {
+                        ...metadataForm,
+                        provider_link_enabled: !!checked,
+                        raw_output: false,
+                      }
+                      if (!checked && next.default_output_mode === 'provider') {
+                        next.default_output_mode = next.normal_link_enabled ? 'normal' : 'provider'
+                      }
+                      setMetadataForm(next)
+                    }}
+                  />
+                </div>
+                {metadataForm.normal_link_enabled && metadataForm.provider_link_enabled && (
+                  <div className='space-y-2'>
+                    <Label>默认输出模式</Label>
+                    <div className='inline-flex rounded-md border text-xs'>
+                      <button
+                        type='button'
+                        className={cn('px-3 py-1.5 rounded-l-md', metadataForm.default_output_mode === 'normal' ? 'bg-accent text-foreground' : 'text-muted-foreground')}
+                        onClick={() => setMetadataForm({ ...metadataForm, default_output_mode: 'normal' })}
+                      >
+                        普通
+                      </button>
+                      <button
+                        type='button'
+                        className={cn('px-3 py-1.5 rounded-r-md border-l', metadataForm.default_output_mode === 'provider' ? 'bg-accent text-foreground' : 'text-muted-foreground')}
+                        onClick={() => setMetadataForm({ ...metadataForm, default_output_mode: 'provider' })}
+                      >
+                        Provider
+                      </button>
+                    </div>
+                    <p className='text-xs text-muted-foreground'>
+                      未带 mode 参数的旧链接使用默认模式，行为保持兼容。
+                    </p>
+                  </div>
+                )}
+                {metadataForm.normal_link_enabled && metadataForm.selected_node_ids.length === 0 && metadataForm.selected_tags.length === 0 && (
+                  <div className='rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300'>
+                    普通链接未筛选节点/标签时，将包含全部已启用节点。启用前请确认范围。
+                  </div>
+                )}
+              </div>
+            )}
+            {metadataForm.template_filename && metadataForm.provider_link_enabled && (
+              <div className='space-y-2 rounded-lg border p-3'>
+                <div className='flex items-center justify-between gap-2'>
+                  <div className='space-y-0.5'>
+                    <Label>Provider 选择</Label>
+                    <p className='text-xs text-muted-foreground'>
+                      不选表示使用全部客户端处理 provider；保存后按请求动态注入 proxy-providers 和代理组 use。
+                    </p>
+                  </div>
+                  {metadataForm.selected_provider_names.length > 0 && (
+                    <Button
+                      type='button'
+                      variant='outline'
+                      size='sm'
+                      onClick={() => setMetadataForm({ ...metadataForm, selected_provider_names: [] })}
+                    >
+                      全部
+                    </Button>
+                  )}
+                </div>
+                {isProxyProviderConfigsLoading ? (
+                  <div className='text-sm text-muted-foreground'>加载 provider 中...</div>
+                ) : clientProxyProviderConfigs.length === 0 ? (
+                  <div className='rounded-md bg-muted/50 px-3 py-2 text-sm text-muted-foreground'>
+                    还没有客户端处理 provider，可在页面下方“管理 Clash Meta proxy-providers 配置”里创建。
+                  </div>
+                ) : (
+                  <div className='grid gap-2 sm:grid-cols-2'>
+                    {clientProxyProviderConfigs.map((config) => {
+                      const checked = metadataForm.selected_provider_names.includes(config.name)
+                      return (
+                        <label
+                          key={config.id}
+                          className='flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-sm'
+                        >
+                          <Checkbox
+                            checked={checked}
+                            onCheckedChange={(value) => {
+                              const isChecked = !!value
+                              const nextNames = isChecked
+                                ? Array.from(new Set([...metadataForm.selected_provider_names, config.name]))
+                                : metadataForm.selected_provider_names.filter(name => name !== config.name)
+                              setMetadataForm({ ...metadataForm, selected_provider_names: nextNames })
+                            }}
+                          />
+                          <span className='min-w-0 truncate'>{config.name}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
+                <div className='flex flex-wrap gap-2 text-xs text-muted-foreground'>
+                  <span>
+                    当前：
+                    {metadataForm.selected_provider_names.length > 0
+                      ? `已选择 ${metadataForm.selected_provider_names.length} 个 provider`
+                      : `全部 ${clientProxyProviderConfigs.length} 个客户端 provider`}
+                  </span>
+                  {metadataForm.selected_provider_names.length > 0 && (
+                    <span className='truncate'>
+                      {metadataForm.selected_provider_names.join('、')}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            {/* 节点选择：普通链接启用时显示，与 Provider 选择并存 */}
+            {metadataForm.template_filename && metadataForm.normal_link_enabled && (
               <div className='space-y-2'>
                 <div className='flex items-center justify-between gap-2'>
                   <Label>节点筛选</Label>
@@ -5613,6 +5839,15 @@ function SubscribeFilesPage() {
                       value={proxyProviderForm.name}
                       onChange={(e) => setProxyProviderForm(prev => ({ ...prev, name: e.target.value }))}
                       placeholder='例如: 机场A'
+                    />
+                  </div>
+                  <div className='space-y-2'>
+                    <Label htmlFor='pp-remark'>备注</Label>
+                    <Input
+                      id='pp-remark'
+                      value={proxyProviderForm.remark}
+                      onChange={(e) => setProxyProviderForm(prev => ({ ...prev, remark: e.target.value }))}
+                      placeholder='例如: 香港节点筛选 / 临时测试'
                     />
                   </div>
                   {/* 妙妙屋处理模式显示 URL */}
@@ -6066,6 +6301,7 @@ function SubscribeFilesPage() {
 
                 const payload = {
                   name: proxyProviderForm.name,
+                  remark: proxyProviderForm.remark,
                   type: proxyProviderForm.type,
                   interval: proxyProviderForm.interval,
                   proxy: proxyProviderForm.proxy,

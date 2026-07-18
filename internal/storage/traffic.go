@@ -205,48 +205,52 @@ type ProbeServer struct {
 
 // Node represents a proxy node stored in the database.
 type Node struct {
-	ID               int64
-	Username         string
-	RawURL           string
-	NodeName         string
-	Protocol         string
-	ParsedConfig     string
-	ClashConfig      string
-	Enabled          bool
-	Tag              string   // 向后兼容，等于 Tags[0]
-	Tags             []string // 多标签支持
-	OriginalServer   string
-	ProbeServer      string // Probe server name for binding
+	ID                int64
+	Username          string
+	RawURL            string
+	NodeName          string
+	Protocol          string
+	ParsedConfig      string
+	ClashConfig       string
+	Enabled           bool
+	Tag               string   // 向后兼容，等于 Tags[0]
+	Tags              []string // 多标签支持
+	OriginalServer    string
+	ProbeServer       string  // Probe server name for binding
 	ChainProxyNodeID  *int64  // 链式代理目标节点 ID
-	RelayGroupName    string   // 中转组名称
-	RelayGroupNodeIDs []int64  // 中转组节点 ID 列表
+	RelayGroupName    string  // 中转组名称
+	RelayGroupNodeIDs []int64 // 中转组节点 ID 列表
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
 
 // SubscribeFile represents a subscription file configuration.
 type SubscribeFile struct {
-	ID                  int64
-	Name                string
-	Description         string
-	URL                 string
-	Type                string
-	Filename            string
-	FileShortCode       string     // 3-character code for file identification in composite short links
-	CustomShortCode     string     // User-defined short code (replaces FileShortCode when set)
-	AutoSyncCustomRules      bool    // Whether to automatically sync custom rules to this file
-	SelectedCustomRuleIDs    []int64 // 选中的自定义规则 ID，为空且开启覆写时表示应用全部已启用规则
-	SelectedOverrideScriptIDs []int64 // 选中的覆写脚本 ID，为空且开启覆写时表示应用全部已启用脚本
-	TemplateFilename         string  // 绑定的 V3 模板文件名，为空表示未绑定模板
-	SelectedTags             []string // 选中的节点标签，为空表示使用所有节点(legacy,与 SelectedNodeIDs 二选一)
-	SelectedNodeIDs          []int64  // 选中的节点 ID,非空时优先于 SelectedTags 过滤
-	RawOutput           bool       // 非Clash配置，直接输出原始内容
-	SortOrder           int        // 排序权重，值越小越靠前
-	TrafficLimit        *float64   // 手动设置的总流量上限(GB)，nil表示跟随探针
-	StatsServerIDs      string     // 统计服务器的探针服务器ID列表(逗号分隔)
-	ExpireAt            *time.Time // Optional expiration timestamp
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                        int64
+	Name                      string
+	Description               string
+	URL                       string
+	Type                      string
+	Filename                  string
+	FileShortCode             string     // 3-character code for file identification in composite short links
+	CustomShortCode           string     // User-defined short code (replaces FileShortCode when set)
+	AutoSyncCustomRules       bool       // Whether to automatically sync custom rules to this file
+	SelectedCustomRuleIDs     []int64    // 选中的自定义规则 ID，为空且开启覆写时表示应用全部已启用规则
+	SelectedOverrideScriptIDs []int64    // 选中的覆写脚本 ID，为空且开启覆写时表示应用全部已启用脚本
+	TemplateFilename          string     // 绑定的 V3 模板文件名，为空表示未绑定模板
+	SelectedTags              []string   // 选中的节点标签，为空表示使用所有节点(legacy,与 SelectedNodeIDs 二选一)
+	SelectedNodeIDs           []int64    // 选中的节点 ID,非空时优先于 SelectedTags 过滤
+	SelectedProviderNames     []string   // Provider 模式下选中的 proxy-provider 名称，为空表示全部 client provider
+	RawOutput                 bool       // 非 Clash 原始文件输出（与 Provider 模式无关）
+	NormalLinkEnabled         bool       // 是否启用普通链接（节点/标签模板生成）
+	ProviderLinkEnabled       bool       // 是否启用 Provider 链接（proxy-providers / use）
+	DefaultOutputMode         string     // 默认输出模式：normal | provider
+	SortOrder                 int        // 排序权重，值越小越靠前
+	TrafficLimit              *float64   // 手动设置的总流量上限(GB)，nil表示跟随探针
+	StatsServerIDs            string     // 统计服务器的探针服务器ID列表(逗号分隔)
+	ExpireAt                  *time.Time // Optional expiration timestamp
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 // UserSettings represents user-specific configuration.
@@ -274,17 +278,17 @@ type UserSettings struct {
 
 // SystemConfig represents global system configuration shared across all users.
 type SystemConfig struct {
-	ProxyGroupsSourceURL    string // Remote URL for proxy groups configuration
-	ClientCompatibilityMode bool   // Auto-filter incompatible nodes for clients
-	SilentMode              bool   // Silent mode: return 404 for all requests except subscription
-	SilentModeTimeout       int    // Minutes to allow access after subscription fetch (default 15)
-	EnableSubInfoNodes      bool   // Enable subscription info nodes (expire time and remaining traffic)
-	SubInfoExpirePrefix     string // Prefix for expire time node, default "📅过期时间"
-	SubInfoTrafficPrefix    string // Prefix for remaining traffic node, default "⌛剩余流量"
-	EnableShortLink         bool   // 启用短链接（全局设置）
-	EnableSubTrafficHeader  bool   // 启用订阅响应头流量信息
-	EnableOverrideScripts      bool   // 启用覆写脚本功能
-	SubscriptionOutputFormat   string // 订阅输出格式: "yaml" (default) or "json"
+	ProxyGroupsSourceURL     string // Remote URL for proxy groups configuration
+	ClientCompatibilityMode  bool   // Auto-filter incompatible nodes for clients
+	SilentMode               bool   // Silent mode: return 404 for all requests except subscription
+	SilentModeTimeout        int    // Minutes to allow access after subscription fetch (default 15)
+	EnableSubInfoNodes       bool   // Enable subscription info nodes (expire time and remaining traffic)
+	SubInfoExpirePrefix      string // Prefix for expire time node, default "📅过期时间"
+	SubInfoTrafficPrefix     string // Prefix for remaining traffic node, default "⌛剩余流量"
+	EnableShortLink          bool   // 启用短链接（全局设置）
+	EnableSubTrafficHeader   bool   // 启用订阅响应头流量信息
+	EnableOverrideScripts    bool   // 启用覆写脚本功能
+	SubscriptionOutputFormat string // 订阅输出格式: "yaml" (default) or "json"
 	// Telegram notification settings
 	NotifyEnabled          bool
 	TelegramBotToken       string
@@ -360,6 +364,7 @@ type ProxyProviderConfig struct {
 	Username                  string
 	ExternalSubscriptionID    int64
 	Name                      string // 代理集合名称
+	Remark                    string // 备注
 	Type                      string // http/file
 	Interval                  int    // 更新间隔(秒)
 	Proxy                     string // 下载代理
@@ -1103,6 +1108,11 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 		return err
 	}
 
+	// Dual-mode link flags must run after template_filename exists (migration filters on it).
+	if err := r.ensureSubscribeOutputModeColumns(); err != nil {
+		return err
+	}
+
 	// 添加 selected_tags 字段，用于存储选中的节点标签（JSON 数组）
 	if err := r.ensureSubscribeFileColumn("selected_tags", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
@@ -1116,6 +1126,9 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 		return err
 	}
 	if err := r.ensureSubscribeFileColumn("selected_override_script_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("selected_provider_names", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
 
@@ -1195,6 +1208,7 @@ CREATE TABLE IF NOT EXISTS proxy_provider_configs (
     username TEXT NOT NULL,
     external_subscription_id INTEGER NOT NULL,
     name TEXT NOT NULL,
+    remark TEXT,
     type TEXT NOT NULL DEFAULT 'http',
     interval INTEGER DEFAULT 3600,
     proxy TEXT DEFAULT 'DIRECT',
@@ -1226,6 +1240,9 @@ CREATE INDEX IF NOT EXISTS idx_proxy_provider_configs_external_subscription_id O
 	// 添加 geo_ip_filter 列（为旧数据库迁移）
 	if err := r.ensureProxyProviderConfigColumn("geo_ip_filter", "TEXT"); err != nil {
 		return fmt.Errorf("ensure geo_ip_filter column: %w", err)
+	}
+	if err := r.ensureProxyProviderConfigColumn("remark", "TEXT"); err != nil {
+		return fmt.Errorf("ensure proxy provider remark column: %w", err)
 	}
 
 	const speedTestResultsSchema = `
@@ -1991,9 +2008,26 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 }
 
 func (r *TrafficRepository) ensureSubscribeFileColumn(name, definition string) error {
+	exists, err := r.subscribeFileColumnExists(name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	alter := fmt.Sprintf("ALTER TABLE subscribe_files ADD COLUMN %s %s", name, definition)
+	if _, err := r.db.Exec(alter); err != nil {
+		return fmt.Errorf("add column %s: %w", name, err)
+	}
+
+	return nil
+}
+
+func (r *TrafficRepository) subscribeFileColumnExists(name string) (bool, error) {
 	rows, err := r.db.Query(`PRAGMA table_info(subscribe_files)`)
 	if err != nil {
-		return fmt.Errorf("subscribe_files table info: %w", err)
+		return false, fmt.Errorf("subscribe_files table info: %w", err)
 	}
 	defer rows.Close()
 
@@ -2007,16 +2041,43 @@ func (r *TrafficRepository) ensureSubscribeFileColumn(name, definition string) e
 			pk         int
 		)
 		if err := rows.Scan(&cid, &colName, &colType, &notNull, &defaultVal, &pk); err != nil {
-			return fmt.Errorf("scan table info: %w", err)
+			return false, fmt.Errorf("scan table info: %w", err)
 		}
 		if strings.EqualFold(colName, name) {
-			return nil
+			return true, nil
 		}
 	}
+	return false, rows.Err()
+}
 
-	alter := fmt.Sprintf("ALTER TABLE subscribe_files ADD COLUMN %s %s", name, definition)
-	if _, err := r.db.Exec(alter); err != nil {
-		return fmt.Errorf("add column %s: %w", name, err)
+// ensureSubscribeOutputModeColumns adds dual-mode columns and migrates legacy Provider-mode rows.
+// Legacy: raw_output=1 + template_filename set meant Provider mode (not true raw file).
+func (r *TrafficRepository) ensureSubscribeOutputModeColumns() error {
+	if err := r.ensureSubscribeFileColumn("normal_link_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("provider_link_enabled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("default_output_mode", "TEXT NOT NULL DEFAULT 'normal'"); err != nil {
+		return err
+	}
+
+	// Old Provider mode: template bound + raw_output reused as provider flag.
+	// Migrate to provider-only, default provider, and restore raw_output=0.
+	// Security: do not auto-enable normal link (empty node filter would mean all admin nodes).
+	// The predicate becomes false after a successful update, so this is safe to run on every startup
+	// and recovers if a previous startup stopped after adding columns but before migrating rows.
+	if _, err := r.db.Exec(`
+UPDATE subscribe_files
+SET provider_link_enabled = 1,
+    normal_link_enabled = 0,
+    default_output_mode = 'provider',
+    raw_output = 0
+WHERE COALESCE(raw_output, 0) = 1
+  AND COALESCE(template_filename, '') != ''
+`); err != nil {
+		return fmt.Errorf("migrate legacy provider-mode subscribe files: %w", err)
 	}
 
 	return nil
@@ -3654,8 +3715,9 @@ func (r *TrafficRepository) GetUserSubscriptions(ctx context.Context, username s
 		return nil, errors.New("username is required")
 	}
 
-	const stmt = `
-		SELECT s.id, s.name, COALESCE(s.description, ''), COALESCE(s.url, ''), s.type, s.filename, COALESCE(s.file_short_code, ''), COALESCE(s.custom_short_code, ''), COALESCE(s.auto_sync_custom_rules, 0), COALESCE(s.template_filename, ''), COALESCE(s.sort_order, 0), s.expire_at, s.created_at, s.updated_at
+	stmt := `
+		SELECT s.id, s.name, COALESCE(s.description, ''), COALESCE(s.url, ''), s.type, s.filename, COALESCE(s.file_short_code, ''), COALESCE(s.custom_short_code, ''), COALESCE(s.auto_sync_custom_rules, 0), COALESCE(s.template_filename, ''), COALESCE(s.sort_order, 0), s.expire_at, s.created_at, s.updated_at,
+			COALESCE(s.raw_output, 0), COALESCE(s.normal_link_enabled, 1), COALESCE(s.provider_link_enabled, 0), COALESCE(s.default_output_mode, 'normal')
 		FROM subscribe_files s
 		INNER JOIN user_subscriptions us ON s.id = us.subscription_id
 		WHERE us.username = ?
@@ -3672,10 +3734,16 @@ func (r *TrafficRepository) GetUserSubscriptions(ctx context.Context, username s
 		var sub SubscribeFile
 		var autoSync int
 		var expireAt sql.NullTime
-		if err := rows.Scan(&sub.ID, &sub.Name, &sub.Description, &sub.URL, &sub.Type, &sub.Filename, &sub.FileShortCode, &sub.CustomShortCode, &autoSync, &sub.TemplateFilename, &sub.SortOrder, &expireAt, &sub.CreatedAt, &sub.UpdatedAt); err != nil {
+		var rawOutput, normalLink, providerLink int
+		var defaultMode string
+		if err := rows.Scan(&sub.ID, &sub.Name, &sub.Description, &sub.URL, &sub.Type, &sub.Filename, &sub.FileShortCode, &sub.CustomShortCode, &autoSync, &sub.TemplateFilename, &sub.SortOrder, &expireAt, &sub.CreatedAt, &sub.UpdatedAt, &rawOutput, &normalLink, &providerLink, &defaultMode); err != nil {
 			return nil, fmt.Errorf("scan subscription: %w", err)
 		}
 		sub.AutoSyncCustomRules = autoSync != 0
+		sub.RawOutput = rawOutput != 0
+		sub.NormalLinkEnabled = normalLink != 0
+		sub.ProviderLinkEnabled = providerLink != 0
+		sub.DefaultOutputMode = NormalizeDefaultOutputMode(defaultMode)
 		if expireAt.Valid {
 			sub.ExpireAt = &expireAt.Time
 		}
@@ -4454,13 +4522,13 @@ func (r *TrafficRepository) CreateProxyProviderConfig(ctx context.Context, confi
 
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO proxy_provider_configs (
-			username, external_subscription_id, name, type, interval, proxy, size_limit, header,
+			username, external_subscription_id, name, remark, type, interval, proxy, size_limit, header,
 			health_check_enabled, health_check_url, health_check_interval, health_check_timeout,
 			health_check_lazy, health_check_expected_status,
 			filter, exclude_filter, exclude_type, geo_ip_filter, override, process_mode
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		config.Username, config.ExternalSubscriptionID, config.Name, config.Type,
+		config.Username, config.ExternalSubscriptionID, config.Name, config.Remark, config.Type,
 		config.Interval, config.Proxy, config.SizeLimit, config.Header,
 		healthCheckEnabled, config.HealthCheckURL, config.HealthCheckInterval, config.HealthCheckTimeout,
 		healthCheckLazy, config.HealthCheckExpectedStatus,
@@ -4480,7 +4548,7 @@ func (r *TrafficRepository) GetProxyProviderConfig(ctx context.Context, id int64
 	}
 
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, username, external_subscription_id, name, type, interval, proxy, size_limit,
+		SELECT id, username, external_subscription_id, name, COALESCE(remark, ''), type, interval, proxy, size_limit,
 			COALESCE(header, ''), health_check_enabled, health_check_url, health_check_interval,
 			health_check_timeout, health_check_lazy, health_check_expected_status,
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
@@ -4491,7 +4559,7 @@ func (r *TrafficRepository) GetProxyProviderConfig(ctx context.Context, id int64
 	var config ProxyProviderConfig
 	var healthCheckEnabled, healthCheckLazy int
 	err := row.Scan(
-		&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Type,
+		&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Remark, &config.Type,
 		&config.Interval, &config.Proxy, &config.SizeLimit, &config.Header,
 		&healthCheckEnabled, &config.HealthCheckURL, &config.HealthCheckInterval,
 		&config.HealthCheckTimeout, &healthCheckLazy, &config.HealthCheckExpectedStatus,
@@ -4518,7 +4586,7 @@ func (r *TrafficRepository) GetProxyProviderConfigByName(ctx context.Context, na
 	}
 
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, username, external_subscription_id, name, type, interval, proxy, size_limit,
+		SELECT id, username, external_subscription_id, name, COALESCE(remark, ''), type, interval, proxy, size_limit,
 			COALESCE(header, ''), health_check_enabled, health_check_url, health_check_interval,
 			health_check_timeout, health_check_lazy, health_check_expected_status,
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
@@ -4529,7 +4597,7 @@ func (r *TrafficRepository) GetProxyProviderConfigByName(ctx context.Context, na
 	var config ProxyProviderConfig
 	var healthCheckEnabled, healthCheckLazy int
 	err := row.Scan(
-		&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Type,
+		&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Remark, &config.Type,
 		&config.Interval, &config.Proxy, &config.SizeLimit, &config.Header,
 		&healthCheckEnabled, &config.HealthCheckURL, &config.HealthCheckInterval,
 		&config.HealthCheckTimeout, &healthCheckLazy, &config.HealthCheckExpectedStatus,
@@ -4556,7 +4624,7 @@ func (r *TrafficRepository) ListProxyProviderConfigs(ctx context.Context, userna
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, username, external_subscription_id, name, type, interval, proxy, size_limit,
+		SELECT id, username, external_subscription_id, name, COALESCE(remark, ''), type, interval, proxy, size_limit,
 			COALESCE(header, ''), health_check_enabled, health_check_url, health_check_interval,
 			health_check_timeout, health_check_lazy, health_check_expected_status,
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
@@ -4573,7 +4641,7 @@ func (r *TrafficRepository) ListProxyProviderConfigs(ctx context.Context, userna
 		var config ProxyProviderConfig
 		var healthCheckEnabled, healthCheckLazy int
 		err := rows.Scan(
-			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Type,
+			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Remark, &config.Type,
 			&config.Interval, &config.Proxy, &config.SizeLimit, &config.Header,
 			&healthCheckEnabled, &config.HealthCheckURL, &config.HealthCheckInterval,
 			&config.HealthCheckTimeout, &healthCheckLazy, &config.HealthCheckExpectedStatus,
@@ -4602,7 +4670,7 @@ func (r *TrafficRepository) ListProxyProviderConfigsBySubscription(ctx context.C
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, username, external_subscription_id, name, type, interval, proxy, size_limit,
+		SELECT id, username, external_subscription_id, name, COALESCE(remark, ''), type, interval, proxy, size_limit,
 			COALESCE(header, ''), health_check_enabled, health_check_url, health_check_interval,
 			health_check_timeout, health_check_lazy, health_check_expected_status,
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
@@ -4619,7 +4687,7 @@ func (r *TrafficRepository) ListProxyProviderConfigsBySubscription(ctx context.C
 		var config ProxyProviderConfig
 		var healthCheckEnabled, healthCheckLazy int
 		err := rows.Scan(
-			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Type,
+			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Remark, &config.Type,
 			&config.Interval, &config.Proxy, &config.SizeLimit, &config.Header,
 			&healthCheckEnabled, &config.HealthCheckURL, &config.HealthCheckInterval,
 			&config.HealthCheckTimeout, &healthCheckLazy, &config.HealthCheckExpectedStatus,
@@ -4649,7 +4717,7 @@ func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, username, external_subscription_id, name, type, interval, proxy, size_limit,
+		SELECT id, username, external_subscription_id, name, COALESCE(remark, ''), type, interval, proxy, size_limit,
 			COALESCE(header, ''), health_check_enabled, health_check_url, health_check_interval,
 			health_check_timeout, health_check_lazy, health_check_expected_status,
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
@@ -4668,7 +4736,7 @@ func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]
 		var config ProxyProviderConfig
 		var healthCheckEnabled, healthCheckLazy int
 		err := rows.Scan(
-			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Type,
+			&config.ID, &config.Username, &config.ExternalSubscriptionID, &config.Name, &config.Remark, &config.Type,
 			&config.Interval, &config.Proxy, &config.SizeLimit, &config.Header,
 			&healthCheckEnabled, &config.HealthCheckURL, &config.HealthCheckInterval,
 			&config.HealthCheckTimeout, &healthCheckLazy, &config.HealthCheckExpectedStatus,
@@ -4707,14 +4775,14 @@ func (r *TrafficRepository) UpdateProxyProviderConfig(ctx context.Context, confi
 
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE proxy_provider_configs SET
-			name = ?, type = ?, interval = ?, proxy = ?, size_limit = ?, header = ?,
+			name = ?, remark = ?, type = ?, interval = ?, proxy = ?, size_limit = ?, header = ?,
 			health_check_enabled = ?, health_check_url = ?, health_check_interval = ?,
 			health_check_timeout = ?, health_check_lazy = ?, health_check_expected_status = ?,
 			filter = ?, exclude_filter = ?, exclude_type = ?, geo_ip_filter = ?, override = ?, process_mode = ?,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND username = ?
 	`,
-		config.Name, config.Type, config.Interval, config.Proxy, config.SizeLimit, config.Header,
+		config.Name, config.Remark, config.Type, config.Interval, config.Proxy, config.SizeLimit, config.Header,
 		healthCheckEnabled, config.HealthCheckURL, config.HealthCheckInterval,
 		config.HealthCheckTimeout, healthCheckLazy, config.HealthCheckExpectedStatus,
 		config.Filter, config.ExcludeFilter, config.ExcludeType, config.GeoIPFilter, config.Override, config.ProcessMode,
@@ -4817,7 +4885,7 @@ WHERE id = 1
 				SubRateLimitEnabled:      true,
 				SubRateLimitMax:          30,
 				SubRateLimitWindow:       120,
-				SkipLocalIP:             true,
+				SkipLocalIP:              true,
 			}, nil
 		}
 		return SystemConfig{}, fmt.Errorf("query system config: %w", err)

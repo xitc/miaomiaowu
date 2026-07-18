@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowu/internal/storage"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
+	"miaomiaowu/internal/storage"
 	"miaomiaowu/internal/validator"
 
 	"gopkg.in/yaml.v3"
@@ -464,8 +464,34 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	if req.SelectedOverrideScriptIDs != nil {
 		existing.SelectedOverrideScriptIDs = req.SelectedOverrideScriptIDs
 	}
+	rawOutputChanged := false
 	if req.RawOutput != nil {
+		rawOutputChanged = existing.RawOutput != *req.RawOutput
 		existing.RawOutput = *req.RawOutput
+	}
+	linkModeChanged := false
+	if req.NormalLinkEnabled != nil {
+		if existing.NormalLinkEnabled != *req.NormalLinkEnabled {
+			linkModeChanged = true
+		}
+		existing.NormalLinkEnabled = *req.NormalLinkEnabled
+	}
+	if req.ProviderLinkEnabled != nil {
+		if existing.ProviderLinkEnabled != *req.ProviderLinkEnabled {
+			linkModeChanged = true
+		}
+		existing.ProviderLinkEnabled = *req.ProviderLinkEnabled
+	}
+	if req.DefaultOutputMode != nil {
+		mode, err := storage.ParseOutputMode(*req.DefaultOutputMode)
+		if err != nil {
+			writeBadRequest(w, err.Error())
+			return
+		}
+		if existing.DefaultOutputMode != mode {
+			linkModeChanged = true
+		}
+		existing.DefaultOutputMode = mode
 	}
 	if req.TrafficLimit != nil {
 		existing.TrafficLimit = req.TrafficLimit
@@ -481,7 +507,7 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 			templateJustBound = true
 		}
 	}
-	// 更新选中的节点标签(legacy)
+	// 更新选中的节点标签(legacy) — 与 Provider 选择独立保存，互不因开关清空
 	if req.SelectedTags != nil {
 		existing.SelectedTags = req.SelectedTags
 		tagsChanged = true
@@ -489,6 +515,10 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	// 更新选中的节点 ID(新模式,精确)。非空时优先于 SelectedTags
 	if req.SelectedNodeIDs != nil {
 		existing.SelectedNodeIDs = req.SelectedNodeIDs
+		tagsChanged = true
+	}
+	if req.SelectedProviderNames != nil {
+		existing.SelectedProviderNames = req.SelectedProviderNames
 		tagsChanged = true
 	}
 	// 更新自定义短链接码
@@ -549,6 +579,23 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		needRenameFile = true
 	}
 
+	// Dual-mode validation
+	clientProviderCount := 0
+	if existing.ProviderLinkEnabled {
+		username := auth.UsernameFromContext(r.Context())
+		if configs, err := h.repo.ListProxyProviderConfigs(r.Context(), username); err == nil {
+			for _, c := range configs {
+				if c.ProcessMode == "" || c.ProcessMode == "client" {
+					clientProviderCount++
+				}
+			}
+		}
+	}
+	if err := storage.ValidateSubscribeOutputModes(existing, clientProviderCount); err != nil {
+		writeBadRequest(w, err.Error())
+		return
+	}
+
 	updated, err := h.repo.UpdateSubscribeFile(r.Context(), existing)
 	if err != nil {
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
@@ -582,8 +629,9 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		// 如果旧文件不存在，只更新数据库记录，不报错
 	}
 
-	// 如果绑定了V3模板或标签变化，从模板重新生成订阅文件
-	if (templateJustBound || tagsChanged) && updated.TemplateFilename != "" {
+	// 普通链接模式：绑定模板 / 节点筛选 / 模式变化时写回 subscribes/<filename>
+	// Provider 模式按请求动态生成，不写入共享订阅文件，避免与普通产物互相覆盖。
+	if (templateJustBound || tagsChanged || rawOutputChanged || linkModeChanged) && updated.TemplateFilename != "" && updated.NormalLinkEnabled {
 		go func() {
 			ctx := context.Background()
 			username := auth.UsernameFromContext(r.Context())
@@ -681,9 +729,13 @@ type subscribeFileRequest struct {
 	TemplateFilename          *string  `json:"template_filename,omitempty"`
 	SelectedTags              []string `json:"selected_tags,omitempty"`
 	SelectedNodeIDs           []int64  `json:"selected_node_ids,omitempty"`
+	SelectedProviderNames     []string `json:"selected_provider_names,omitempty"`
 	CustomShortCode           *string  `json:"custom_short_code,omitempty"` // 自定义短链接码
 	ExpireAt                  *string  `json:"expire_at,omitempty"`
-	RawOutput                 *bool    `json:"raw_output,omitempty"` // 非Clash配置，直接输出原始内容
+	RawOutput                 *bool    `json:"raw_output,omitempty"` // 非 Clash 原始文件输出
+	NormalLinkEnabled         *bool    `json:"normal_link_enabled,omitempty"`
+	ProviderLinkEnabled       *bool    `json:"provider_link_enabled,omitempty"`
+	DefaultOutputMode         *string  `json:"default_output_mode,omitempty"`
 	TrafficLimit              *float64 `json:"traffic_limit,omitempty"`
 	StatsServerIDs            *string  `json:"stats_server_ids,omitempty"`
 }
@@ -701,8 +753,12 @@ type subscribeFileDTO struct {
 	TemplateFilename          string     `json:"template_filename"`
 	SelectedTags              []string   `json:"selected_tags"`
 	SelectedNodeIDs           []int64    `json:"selected_node_ids"`
+	SelectedProviderNames     []string   `json:"selected_provider_names"`
 	CustomShortCode           string     `json:"custom_short_code"`
 	RawOutput                 bool       `json:"raw_output"`
+	NormalLinkEnabled         bool       `json:"normal_link_enabled"`
+	ProviderLinkEnabled       bool       `json:"provider_link_enabled"`
+	DefaultOutputMode         string     `json:"default_output_mode"`
 	TrafficLimit              *float64   `json:"traffic_limit"`
 	StatsServerIDs            string     `json:"stats_server_ids"`
 	CreatedAt                 time.Time  `json:"created_at"`
@@ -718,6 +774,10 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 	selectedNodeIDs := file.SelectedNodeIDs
 	if selectedNodeIDs == nil {
 		selectedNodeIDs = []int64{}
+	}
+	selectedProviderNames := file.SelectedProviderNames
+	if selectedProviderNames == nil {
+		selectedProviderNames = []string{}
 	}
 	ruleIDs := file.SelectedCustomRuleIDs
 	if ruleIDs == nil {
@@ -740,8 +800,12 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		TemplateFilename:          file.TemplateFilename,
 		SelectedTags:              selectedTags,
 		SelectedNodeIDs:           selectedNodeIDs,
+		SelectedProviderNames:     selectedProviderNames,
 		CustomShortCode:           file.CustomShortCode,
 		RawOutput:                 file.RawOutput,
+		NormalLinkEnabled:         file.NormalLinkEnabled,
+		ProviderLinkEnabled:       file.ProviderLinkEnabled,
+		DefaultOutputMode:         storage.NormalizeDefaultOutputMode(file.DefaultOutputMode),
 		TrafficLimit:              file.TrafficLimit,
 		StatsServerIDs:            file.StatsServerIDs,
 		CreatedAt:                 file.CreatedAt,
@@ -795,15 +859,16 @@ func parseExpireAt(raw *string) (*time.Time, error) {
 // handleCreateFromConfig 保存生成的配置为订阅文件
 func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name             string   `json:"name"`
-		Description      string   `json:"description"`
-		Filename         string   `json:"filename"`
-		Content          string   `json:"content"`
-		TemplateFilename string   `json:"template_filename"` // V3 模板文件名
-		SelectedTags     []string `json:"selected_tags"`     // V3 legacy:按标签选节点
-		SelectedNodeIDs  []int64  `json:"selected_node_ids"` // V3 新:按节点 ID 精确选;非空优先于 SelectedTags
-		TrafficLimit     *float64 `json:"traffic_limit"`
-		StatsServerIDs   string   `json:"stats_server_ids"`
+		Name                  string   `json:"name"`
+		Description           string   `json:"description"`
+		Filename              string   `json:"filename"`
+		Content               string   `json:"content"`
+		TemplateFilename      string   `json:"template_filename"` // V3 模板文件名
+		SelectedTags          []string `json:"selected_tags"`     // V3 legacy:按标签选节点
+		SelectedNodeIDs       []int64  `json:"selected_node_ids"` // V3 新:按节点 ID 精确选;非空优先于 SelectedTags
+		SelectedProviderNames []string `json:"selected_provider_names"`
+		TrafficLimit          *float64 `json:"traffic_limit"`
+		StatsServerIDs        string   `json:"stats_server_ids"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -939,16 +1004,17 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 
 	// 保存到数据库
 	file := storage.SubscribeFile{
-		Name:             req.Name,
-		Description:      req.Description,
-		URL:              "",
-		Type:             storage.SubscribeTypeCreate,
-		Filename:         filename,
-		TemplateFilename: req.TemplateFilename,
-		SelectedTags:     req.SelectedTags,
-		SelectedNodeIDs:  req.SelectedNodeIDs,
-		TrafficLimit:     req.TrafficLimit,
-		StatsServerIDs:   req.StatsServerIDs,
+		Name:                  req.Name,
+		Description:           req.Description,
+		URL:                   "",
+		Type:                  storage.SubscribeTypeCreate,
+		Filename:              filename,
+		TemplateFilename:      req.TemplateFilename,
+		SelectedTags:          req.SelectedTags,
+		SelectedNodeIDs:       req.SelectedNodeIDs,
+		SelectedProviderNames: req.SelectedProviderNames,
+		TrafficLimit:          req.TrafficLimit,
+		StatsServerIDs:        req.StatsServerIDs,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
@@ -1466,6 +1532,12 @@ func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, user
 	if err != nil {
 		logger.Info("[模板生成] 获取代理集合配置失败", "error", err)
 		// 不是致命错误，继续处理
+	}
+
+	// Provider-only generation is request-time; do not write provider YAML into shared subscribe file.
+	if !subscribeFile.NormalLinkEnabled {
+		logger.Info("[模板生成] 仅 Provider 链接已启用，跳过写入普通订阅文件", "subscribe", subscribeFile.Name)
+		return nil
 	}
 
 	// 构建 providers map：provider name -> proxy names

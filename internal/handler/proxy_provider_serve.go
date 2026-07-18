@@ -377,6 +377,10 @@ func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storag
 	// Reorder proxy fields (name, type, server, port first)
 	reorderProxiesNode(filteredProxiesNode)
 
+	if err := validateUniqueProxyNames(filteredProxiesNode); err != nil {
+		return nil, err
+	}
+
 	// Build output document
 	outputDoc := &yaml.Node{
 		Kind: yaml.DocumentNode,
@@ -406,6 +410,42 @@ func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storag
 	// Fix emoji escapes and quoted numbers
 	result := RemoveUnicodeEscapeQuotes(buf.String())
 	return []byte(result), nil
+}
+
+func validateUniqueProxyNames(proxiesNode *yaml.Node) error {
+	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
+		return nil
+	}
+
+	seen := make(map[string]int)
+	duplicateSet := make(map[string]struct{})
+	duplicates := make([]string, 0)
+
+	for _, proxyNode := range proxiesNode.Content {
+		if proxyNode.Kind != yaml.MappingNode {
+			continue
+		}
+		name := strings.TrimSpace(util.GetNodeFieldValue(proxyNode, "name"))
+		if name == "" {
+			continue
+		}
+		seen[name]++
+		if seen[name] == 2 {
+			if _, ok := duplicateSet[name]; !ok {
+				duplicates = append(duplicates, name)
+				duplicateSet[name] = struct{}{}
+			}
+		}
+	}
+
+	if len(duplicates) == 0 {
+		return nil
+	}
+
+	if len(duplicates) > 10 {
+		return fmt.Errorf("检测到重复节点名称: %s 等 %d 个", strings.Join(duplicates[:10], "、"), len(duplicates))
+	}
+	return fmt.Errorf("检测到重复节点名称: %s", strings.Join(duplicates, "、"))
 }
 
 // findProxiesNode finds the proxies node in YAML document

@@ -24,6 +24,7 @@ import (
 type proxyProviderConfigRequest struct {
 	ExternalSubscriptionID int64  `json:"external_subscription_id"`
 	Name                   string `json:"name"`
+	Remark                 string `json:"remark"`
 	Type                   string `json:"type"`
 	Interval               int    `json:"interval"`
 	Proxy                  string `json:"proxy"`
@@ -50,6 +51,7 @@ type proxyProviderConfigResponse struct {
 	ID                        int64  `json:"id"`
 	ExternalSubscriptionID    int64  `json:"external_subscription_id"`
 	Name                      string `json:"name"`
+	Remark                    string `json:"remark"`
 	Type                      string `json:"type"`
 	Interval                  int    `json:"interval"`
 	Proxy                     string `json:"proxy"`
@@ -196,8 +198,9 @@ func handleCreateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 
 	config := &storage.ProxyProviderConfig{
 		Username:                  username,
-		ExternalSubscriptionID:   payload.ExternalSubscriptionID,
+		ExternalSubscriptionID:    payload.ExternalSubscriptionID,
 		Name:                      name,
+		Remark:                    strings.TrimSpace(payload.Remark),
 		Type:                      configType,
 		Interval:                  interval,
 		Proxy:                     proxy,
@@ -215,6 +218,11 @@ func handleCreateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 		GeoIPFilter:               payload.GeoIPFilter,
 		Override:                  payload.Override,
 		ProcessMode:               processMode,
+	}
+
+	if err := validateProxyProviderConfigInput(r.Context(), &sub, config); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 
 	id, err := repo.CreateProxyProviderConfig(r.Context(), config)
@@ -307,6 +315,7 @@ func handleUpdateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 		Username:                  username,
 		ExternalSubscriptionID:    existing.ExternalSubscriptionID,
 		Name:                      name,
+		Remark:                    strings.TrimSpace(payload.Remark),
 		Type:                      configType,
 		Interval:                  interval,
 		Proxy:                     proxy,
@@ -324,6 +333,22 @@ func handleUpdateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 		GeoIPFilter:               payload.GeoIPFilter,
 		Override:                  payload.Override,
 		ProcessMode:               processMode,
+	}
+
+	if shouldValidateProxyProviderInput(existing, config) {
+		sub, err := repo.GetExternalSubscription(r.Context(), existing.ExternalSubscriptionID, username)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if sub.ID == 0 {
+			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+			return
+		}
+		if err := validateProxyProviderConfigInput(r.Context(), &sub, config); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 
 	if err := repo.UpdateProxyProviderConfig(r.Context(), config); err != nil {
@@ -382,6 +407,7 @@ func toProxyProviderConfigResponse(config storage.ProxyProviderConfig) proxyProv
 		ID:                        config.ID,
 		ExternalSubscriptionID:    config.ExternalSubscriptionID,
 		Name:                      config.Name,
+		Remark:                    config.Remark,
 		Type:                      config.Type,
 		Interval:                  config.Interval,
 		Proxy:                     config.Proxy,
@@ -401,6 +427,46 @@ func toProxyProviderConfigResponse(config storage.ProxyProviderConfig) proxyProv
 		ProcessMode:               config.ProcessMode,
 		CreatedAt:                 config.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:                 config.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func shouldValidateProxyProviderInput(existing *storage.ProxyProviderConfig, next *storage.ProxyProviderConfig) bool {
+	if next == nil || next.ProcessMode != "mmw" {
+		return false
+	}
+	if existing == nil {
+		return true
+	}
+	return existing.ProcessMode != next.ProcessMode ||
+		existing.Filter != next.Filter ||
+		existing.ExcludeFilter != next.ExcludeFilter ||
+		existing.ExcludeType != next.ExcludeType ||
+		existing.GeoIPFilter != next.GeoIPFilter ||
+		existing.Override != next.Override
+}
+
+func validateProxyProviderConfigInput(ctx context.Context, sub *storage.ExternalSubscription, config *storage.ProxyProviderConfig) error {
+	if config == nil || config.ProcessMode != "mmw" {
+		return nil
+	}
+	if sub == nil || sub.ID == 0 {
+		return errors.New("external subscription not found")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchAndFilterProxiesYAML(sub, config)
+		done <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("代理集合输入校验失败: %w", err)
+		}
+		return nil
 	}
 }
 

@@ -420,17 +420,20 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 		}
 
 		type item struct {
-			ID              int64      `json:"id"`
-			Name            string     `json:"name"`
-			Description     string     `json:"description"`
-			Filename        string     `json:"filename"`
-			Type            string     `json:"type"`
-			FileShortCode   string     `json:"file_short_code,omitempty"`
-			CustomShortCode string     `json:"custom_short_code,omitempty"`
-			RawOutput       bool       `json:"raw_output"`
-			ExpireAt        *time.Time `json:"expire_at,omitempty"`
-			UpdatedAt       time.Time  `json:"updated_at"`
-			LatestVersion   int64      `json:"latest_version,omitempty"`
+			ID                  int64      `json:"id"`
+			Name                string     `json:"name"`
+			Description         string     `json:"description"`
+			Filename            string     `json:"filename"`
+			Type                string     `json:"type"`
+			FileShortCode       string     `json:"file_short_code,omitempty"`
+			CustomShortCode     string     `json:"custom_short_code,omitempty"`
+			RawOutput           bool       `json:"raw_output"`
+			NormalLinkEnabled   bool       `json:"normal_link_enabled"`
+			ProviderLinkEnabled bool       `json:"provider_link_enabled"`
+			DefaultOutputMode   string     `json:"default_output_mode"`
+			ExpireAt            *time.Time `json:"expire_at,omitempty"`
+			UpdatedAt           time.Time  `json:"updated_at"`
+			LatestVersion       int64      `json:"latest_version,omitempty"`
 		}
 
 		payload := make([]item, 0, len(files))
@@ -450,17 +453,20 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			}
 
 			payload = append(payload, item{
-				ID:              file.ID,
-				Name:            file.Name,
-				Description:     file.Description,
-				Filename:        file.Filename,
-				Type:            file.Type,
-				FileShortCode:   fileShortCode,
-				CustomShortCode: customShortCode,
-				RawOutput:       file.RawOutput,
-				ExpireAt:        file.ExpireAt,
-				UpdatedAt:       file.UpdatedAt,
-				LatestVersion:   latestVersion,
+				ID:                  file.ID,
+				Name:                file.Name,
+				Description:         file.Description,
+				Filename:            file.Filename,
+				Type:                file.Type,
+				FileShortCode:       fileShortCode,
+				CustomShortCode:     customShortCode,
+				RawOutput:           file.RawOutput,
+				NormalLinkEnabled:   file.NormalLinkEnabled,
+				ProviderLinkEnabled: file.ProviderLinkEnabled,
+				DefaultOutputMode:   storage.NormalizeDefaultOutputMode(file.DefaultOutputMode),
+				ExpireAt:            file.ExpireAt,
+				UpdatedAt:           file.UpdatedAt,
+				LatestVersion:       latestVersion,
 			})
 		}
 

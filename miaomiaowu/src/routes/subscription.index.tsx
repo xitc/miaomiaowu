@@ -11,11 +11,6 @@ import {
   QrCode,
   Smartphone,
   ChevronDown,
-  Globe,
-  Laptop,
-  Wifi,
-  Radio,
-  Shield
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Topbar } from '@/components/layout/topbar'
@@ -74,6 +69,8 @@ export const Route = createFileRoute('/subscription/')({
   component: SubscriptionPage,
 })
 
+type OutputMode = 'normal' | 'provider'
+
 type SubscribeFile = {
   id: number
   name: string
@@ -83,6 +80,9 @@ type SubscribeFile = {
   file_short_code?: string
   custom_short_code?: string
   raw_output?: boolean
+  normal_link_enabled?: boolean
+  provider_link_enabled?: boolean
+  default_output_mode?: OutputMode
   expire_at?: string | null
   created_at: string
   updated_at: string
@@ -114,11 +114,23 @@ const CLIENT_TYPES = [
   { type: 'uri', name: 'URI', icon: uriIcon },
 ] as const
 
+function resolveFileModes(file: SubscribeFile) {
+  const providerEnabled = !!file.provider_link_enabled
+  // Legacy fallback: old API only had raw_output for provider-ish links
+  const normalEnabled = file.normal_link_enabled ?? !providerEnabled
+  let defaultMode: OutputMode = file.default_output_mode === 'provider' ? 'provider' : 'normal'
+  if (defaultMode === 'provider' && !providerEnabled) defaultMode = 'normal'
+  if (defaultMode === 'normal' && !normalEnabled && providerEnabled) defaultMode = 'provider'
+  return { normalEnabled, providerEnabled, defaultMode, dual: normalEnabled && providerEnabled }
+}
+
 function SubscriptionPage() {
   const { auth } = useAuthStore()
   const [qrValue, setQrValue] = useState<string | null>(null)
   // 为每个订阅文件保存当前显示的URL
   const [displayURLs, setDisplayURLs] = useState<Record<number, string>>({})
+  // 双模式订阅的当前展示模式
+  const [modeByFile, setModeByFile] = useState<Record<number, OutputMode>>({})
 
   const { data: subscribeFilesData } = useQuery({
     queryKey: ['user-subscriptions'],
@@ -162,7 +174,15 @@ function SubscriptionPage() {
       ? `${window.location.protocol}//${window.location.host}`
       : 'http://localhost:8080')
 
-  const buildSubscriptionURL = (filename: string, fileShortCode: string | undefined, customShortCode: string | undefined, clientType?: string) => {
+  const buildSubscriptionURL = (
+    filename: string,
+    fileShortCode: string | undefined,
+    customShortCode: string | undefined,
+    opts?: { clientType?: string; mode?: OutputMode; dual?: boolean }
+  ) => {
+    const clientType = opts?.clientType
+    const mode = opts?.mode
+    const dual = opts?.dual
     // Use custom short code or file short code + user short code for composite short link
     const fileCode = customShortCode || fileShortCode
     if (fileCode && userShortCode) {
@@ -170,6 +190,10 @@ function SubscriptionPage() {
       const url = new URL(`/${compositeCode}`, baseURL)
       if (clientType) {
         url.searchParams.set('t', clientType)
+      }
+      // 双模式或显式非默认时带上 mode，保证复制/导入行为明确
+      if (mode && dual) {
+        url.searchParams.set('mode', mode)
       }
       return url.toString()
     }
@@ -179,6 +203,9 @@ function SubscriptionPage() {
     url.searchParams.set('filename', filename)
     if (clientType) {
       url.searchParams.set('t', clientType)
+    }
+    if (mode && dual) {
+      url.searchParams.set('mode', mode)
     }
     if (userToken) {
       url.searchParams.set('token', userToken)
@@ -227,17 +254,21 @@ function SubscriptionPage() {
 
           {subscribeFiles.map((file) => {
             const Icon = ICON_MAP[file.name] ?? QrCode
-            const subscribeURL = buildSubscriptionURL(file.filename, file.file_short_code, file.custom_short_code)
+            const modes = resolveFileModes(file)
+            const activeMode: OutputMode = modeByFile[file.id] ?? modes.defaultMode
+            const isProviderView = activeMode === 'provider' && modes.providerEnabled
+            const isRawOnly = !!file.raw_output && !modes.providerEnabled
+
+            const subscribeURL = buildSubscriptionURL(file.filename, file.file_short_code, file.custom_short_code, {
+              mode: activeMode,
+              dual: modes.dual,
+            })
             // 使用当前显示的URL，如果没有则使用默认URL
             const displayURL = displayURLs[file.id] || subscribeURL
             const clashURL = `clash://install-config?url=${encodeURIComponent(subscribeURL)}`
             const updatedLabel = file.updated_at
               ? dateFormatter.format(new Date(file.updated_at))
               : null
-            // All subscribe files show all buttons by default
-            const showQR = true
-            const showCopy = true
-            const showImport = true
 
             return (
               <Card key={file.id} className='flex flex-col justify-between'>
@@ -278,6 +309,11 @@ function SubscriptionPage() {
                         永久有效
                       </Badge>
                     )}
+                    {modes.providerEnabled && (
+                      <Badge variant='outline' className='bg-sky-500/10 text-sky-700 dark:text-sky-400'>
+                        Provider
+                      </Badge>
+                    )}
                     {updatedLabel ? (
                       <p className='text-xs text-muted-foreground'>
                         {updatedLabel}
@@ -289,62 +325,116 @@ function SubscriptionPage() {
                       </Badge>
                     ) : null}
                   </div>
+
+                  {modes.dual && (
+                    <div className='inline-flex w-full rounded-md border text-xs'>
+                      <button
+                        type='button'
+                        className={`flex-1 px-2 py-1.5 rounded-l-md ${activeMode === 'normal' ? 'bg-accent text-foreground' : 'text-muted-foreground'}`}
+                        onClick={() => {
+                          setModeByFile((prev) => ({ ...prev, [file.id]: 'normal' }))
+                          const next = buildSubscriptionURL(file.filename, file.file_short_code, file.custom_short_code, {
+                            mode: 'normal',
+                            dual: true,
+                          })
+                          setDisplayURLs((prev) => ({ ...prev, [file.id]: next }))
+                        }}
+                      >
+                        普通链接
+                      </button>
+                      <button
+                        type='button'
+                        className={`flex-1 px-2 py-1.5 rounded-r-md border-l ${activeMode === 'provider' ? 'bg-accent text-foreground' : 'text-muted-foreground'}`}
+                        onClick={() => {
+                          setModeByFile((prev) => ({ ...prev, [file.id]: 'provider' }))
+                          const next = buildSubscriptionURL(file.filename, file.file_short_code, file.custom_short_code, {
+                            mode: 'provider',
+                            dual: true,
+                          })
+                          setDisplayURLs((prev) => ({ ...prev, [file.id]: next }))
+                        }}
+                      >
+                        Provider 链接
+                      </button>
+                    </div>
+                  )}
+
                   <div className='break-all rounded-lg border bg-muted/40 p-3 font-mono text-xs shadow-inner sm:text-sm'>
                     {displayURL}
                   </div>
                   <div className='grid grid-cols-2 gap-2'>
-                    {file.raw_output ? (
-                      <Button
-                        size='sm'
-                        className='w-full col-span-2 transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
-                        onClick={() => handleCopy(file.id, subscribeURL, '订阅链接')}
-                      >
-                        <Copy className='mr-2 size-4' />
-                        复制订阅链接
-                      </Button>
-                    ) : (
+                    {isRawOnly || isProviderView ? (
                       <>
-                        {showCopy ? (
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                size='sm'
-                                className='w-full transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
-                              >
-                                <Copy className='mr-2 size-4' />
-                                复制
-                                <ChevronDown className='ml-2 size-4' />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align='end' className='w-56'>
-                              {CLIENT_TYPES.map((client) => {
-                                const clientURL = buildSubscriptionURL(file.filename, file.file_short_code, file.custom_short_code, client.type)
-                                return (
-                                  <DropdownMenuItem
-                                    key={client.type}
-                                    onClick={() => handleCopy(file.id, clientURL, client.name, client.type)}
-                                    className='cursor-pointer'
-                                  >
-                                    <img src={client.icon} alt={client.name} className='mr-2 size-4' />
-                                    {client.name}
-                                  </DropdownMenuItem>
-                                )
-                              })}
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        ) : null}
-                        {showImport ? (
+                        <Button
+                          size='sm'
+                          className='w-full col-span-2 transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
+                          onClick={() => handleCopy(file.id, subscribeURL, isProviderView ? 'Provider 链接' : '订阅链接')}
+                        >
+                          <Copy className='mr-2 size-4' />
+                          复制{isProviderView ? ' Provider' : ''}订阅链接
+                        </Button>
+                        {isProviderView && (
                           <Button
                             size='sm'
                             variant='secondary'
-                            className='w-full transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
+                            className='w-full col-span-2 transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
                             asChild
                           >
                             <a href={clashURL}>
                               <Download className='mr-2 size-4' />导入 Clash
                             </a>
                           </Button>
-                        ) : null}
+                        )}
+                        {isProviderView && (
+                          <p className='col-span-2 text-[11px] text-muted-foreground'>
+                            Provider 链接仅提供 Mihomo/Clash YAML、二维码与 Clash 导入。
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              size='sm'
+                              className='w-full transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
+                            >
+                              <Copy className='mr-2 size-4' />
+                              复制
+                              <ChevronDown className='ml-2 size-4' />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align='end' className='w-56'>
+                            {CLIENT_TYPES.map((client) => {
+                              const clientURL = buildSubscriptionURL(
+                                file.filename,
+                                file.file_short_code,
+                                file.custom_short_code,
+                                { clientType: client.type, mode: activeMode, dual: modes.dual }
+                              )
+                              return (
+                                <DropdownMenuItem
+                                  key={client.type}
+                                  onClick={() => handleCopy(file.id, clientURL, client.name, client.type)}
+                                  className='cursor-pointer'
+                                >
+                                  <img src={client.icon} alt={client.name} className='mr-2 size-4' />
+                                  {client.name}
+                                </DropdownMenuItem>
+                              )
+                            })}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                        <Button
+                          size='sm'
+                          variant='secondary'
+                          className='w-full transition-transform hover:-translate-y-0.5 hover:shadow-md active:translate-y-0.5 active:scale-95'
+                          asChild
+                        >
+                          <a href={clashURL}>
+                            <Download className='mr-2 size-4' />导入 Clash
+                          </a>
+                        </Button>
                       </>
                     )}
                   </div>

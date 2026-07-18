@@ -16,11 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowu/internal/auth"
 	"miaomiaowu/internal/notify"
 	"miaomiaowu/internal/scriptengine"
 	"miaomiaowu/internal/storage"
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 
 	"gopkg.in/yaml.v3"
 )
@@ -330,8 +330,19 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// 非Clash配置：直接输出原始文件内容，跳过所有转换处理
-	if hasSubscribeFile && subscribeFile.RawOutput {
+	// 解析输出模式：mode=normal|provider；未传时使用 default_output_mode
+	outputMode := storage.OutputModeNormal
+	if hasSubscribeFile {
+		resolvedMode, modeErr := subscribeFile.ResolveOutputMode(r.URL.Query().Get("mode"))
+		if modeErr != nil {
+			writeError(w, http.StatusBadRequest, modeErr)
+			return
+		}
+		outputMode = resolvedMode
+	}
+
+	// 非 Clash 原始文件：仅 raw_output 且无模板时直接输出（与 Provider 模式无关）
+	if hasSubscribeFile && subscribeFile.RawOutput && subscribeFile.TemplateFilename == "" {
 		rawData, readErr := os.ReadFile(resolvedPath)
 		if readErr != nil {
 			if errors.Is(readErr, os.ErrNotExist) {
@@ -360,20 +371,41 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Provider 模式仅支持 Mihomo/Clash YAML 客户端
+	clientTypeEarly := strings.TrimSpace(r.URL.Query().Get("t"))
+	if hasSubscribeFile && outputMode == storage.OutputModeProvider && !storage.IsClashCompatibleClient(clientTypeEarly) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("Provider 模式仅支持 Mihomo/Clash YAML 客户端，不支持 t=%s", clientTypeEarly))
+		return
+	}
+
 	// 模板生成逻辑：如果订阅绑定了 V3 模板，使用模板生成配置
 	var data []byte
 	fromTemplate := false
 	if hasSubscribeFile && subscribeFile.TemplateFilename != "" {
 		stepStart = time.Now()
-		templateData, err := h.generateFromTemplate(r.Context(), username, subscribeFile)
+		// Provider 模式必须绑定模板；普通模式也优先走模板
+		if outputMode == storage.OutputModeProvider && strings.TrimSpace(subscribeFile.TemplateFilename) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("Provider 模式必须绑定 v3 模板"))
+			return
+		}
+		templateData, err := h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode)
 		if err != nil {
-			logger.Info("[Subscription] 模板生成失败，回退到原始文件", "error", err, "template", subscribeFile.TemplateFilename)
-			// 回退到直接读取文件
+			// 不得静默回退到另一种输出模式
+			if outputMode == storage.OutputModeProvider {
+				logger.Info("[Subscription] Provider 模板生成失败", "error", err, "template", subscribeFile.TemplateFilename)
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Provider 配置生成失败: %w", err))
+				return
+			}
+			logger.Info("[Subscription] 普通模板生成失败，回退到订阅文件缓存", "error", err, "template", subscribeFile.TemplateFilename)
+			// 普通模式可回退到同模式文件缓存
 		} else {
 			data = templateData
 			fromTemplate = true
-			logger.Info("[⏱️ 耗时监测] 模板生成完成", "step", "template_generate", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
+			logger.Info("[⏱️ 耗时监测] 模板生成完成", "step", "template_generate", "mode", outputMode, "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
 		}
+	} else if hasSubscribeFile && outputMode == storage.OutputModeProvider {
+		writeError(w, http.StatusBadRequest, errors.New("Provider 模式必须绑定 v3 模板"))
+		return
 	}
 
 	// 文件读取（如果模板生成失败或未绑定模板）
@@ -2313,12 +2345,23 @@ func sortProxiesByNodeOrder(ctx context.Context, repo *storage.TrafficRepository
 	return nil
 }
 
-// generateFromTemplate 基于绑定的 V3 模板生成订阅配置
-// 代理节点来源：节点表（nodes），代理集合来源：代理集合表（proxy_provider_configs）
-func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile) ([]byte, error) {
+func matchesSubscribeNodeSelection(node storage.Node, selectedNodeIDs map[int64]bool, selectedTags map[string]bool) bool {
+	if len(selectedNodeIDs) > 0 {
+		return selectedNodeIDs[node.ID]
+	}
+	if len(selectedTags) > 0 {
+		return node.HasAnyTag(selectedTags)
+	}
+	return true
+}
+
+// generateFromTemplate 基于绑定的 V3 模板生成订阅配置。
+// outputMode 为 normal（节点/标签）或 provider（proxy-providers / use）。
+func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile, outputMode string) ([]byte, error) {
 	if subscribeFile.TemplateFilename == "" {
 		return nil, errors.New("订阅未绑定模板")
 	}
+	outputMode = storage.NormalizeDefaultOutputMode(outputMode)
 
 	// 1. 读取模板文件
 	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
@@ -2345,12 +2388,18 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		sortNodesByNodeOrder(nodes, settings.NodeOrder)
 	}
 
-	// 构建选中标签的 map 用于快速查找
+	// 节点 ID 精确筛选优先；为空时回退标签筛选（legacy）。
+	selectedNodeIDsMap := make(map[int64]bool, len(subscribeFile.SelectedNodeIDs))
+	for _, id := range subscribeFile.SelectedNodeIDs {
+		selectedNodeIDsMap[id] = true
+	}
+	hasNodeFilter := len(selectedNodeIDsMap) > 0
+
 	selectedTagsMap := make(map[string]bool)
 	for _, tag := range subscribeFile.SelectedTags {
 		selectedTagsMap[tag] = true
 	}
-	hasTagFilter := len(selectedTagsMap) > 0
+	hasTagFilter := !hasNodeFilter && len(selectedTagsMap) > 0
 
 	// 构建节点 ID -> 名称映射（用于链式代理解析）
 	nodeIDToName := make(map[int64]string, len(nodes))
@@ -2392,8 +2441,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		if !node.Enabled {
 			continue // 跳过禁用的节点
 		}
-		// 标签过滤：只使用选中标签的节点
-		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+		if !matchesSubscribeNodeSelection(node, selectedNodeIDsMap, selectedTagsMap) {
 			continue
 		}
 		proxyConfig, ok := buildProxyConfig(node)
@@ -2413,7 +2461,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
 			continue
 		}
-		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+		if !matchesSubscribeNodeSelection(node, selectedNodeIDsMap, selectedTagsMap) {
 			continue
 		}
 		if _, exists := relayGroupMap[node.RelayGroupName]; exists {
@@ -2452,13 +2500,28 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		relayGroups = append(relayGroups, rg)
 	}
 
-	logger.Info("[模板生成] 从节点表获取代理节点", "total", len(nodes), "enabled", len(proxies), "tag_filter", hasTagFilter, "relay_groups", len(relayGroups))
+	logger.Info("[模板生成] 从节点表获取代理节点", "total", len(nodes), "enabled", len(proxies), "node_filter", hasNodeFilter, "tag_filter", hasTagFilter, "relay_groups", len(relayGroups))
 
 	// 3. 从代理集合表获取代理集合配置（用于 proxy-providers）
 	providerConfigs, err := h.repo.ListProxyProviderConfigs(ctx, nodeOwner)
 	if err != nil {
 		logger.Info("[模板生成] 获取代理集合配置失败", "error", err)
 		// 不是致命错误，继续处理
+	}
+
+	if outputMode == storage.OutputModeProvider {
+		providerConfigs = filterProxyProviderConfigs(providerConfigs, subscribeFile.SelectedProviderNames)
+		providerURLs := h.getProviderExternalURLs(ctx, nodeOwner, providerConfigs)
+		providerConfigs = filterUsableClientProxyProviders(providerConfigs, providerURLs)
+		if len(providerConfigs) == 0 {
+			return nil, errors.New("没有可用且来源地址有效的 client provider（可能已失效或未选择）")
+		}
+		result, err := processProviderOnlyV3Template(string(templateContent), providerConfigs, providerURLs)
+		if err != nil {
+			return nil, fmt.Errorf("处理 Provider 模板失败: %w", err)
+		}
+		logger.Info("[模板生成] Provider 模式模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "providers", len(providerConfigs), "result_bytes", len(result))
+		return []byte(result), nil
 	}
 
 	// 构建 providers map：provider name -> proxy names
@@ -2509,6 +2572,347 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "result_bytes", len(result))
 
 	return []byte(result), nil
+}
+
+func (h *SubscriptionHandler) getProviderExternalURLs(ctx context.Context, username string, providerConfigs []storage.ProxyProviderConfig) map[int64]string {
+	providerURLs := make(map[int64]string)
+	for _, config := range providerConfigs {
+		if config.ProcessMode != "" && config.ProcessMode != "client" {
+			continue
+		}
+		sub, err := h.repo.GetExternalSubscription(ctx, config.ExternalSubscriptionID, username)
+		if err != nil || sub.ID == 0 {
+			logger.Info("[模板生成] 获取代理集合外部订阅失败", "provider", config.Name, "external_subscription_id", config.ExternalSubscriptionID, "error", err)
+			continue
+		}
+		providerURLs[config.ExternalSubscriptionID] = sub.URL
+	}
+	return providerURLs
+}
+
+func (h *subscribeFilesHandler) getProviderExternalURLs(ctx context.Context, username string, providerConfigs []storage.ProxyProviderConfig) map[int64]string {
+	providerURLs := make(map[int64]string)
+	for _, config := range providerConfigs {
+		if config.ProcessMode != "" && config.ProcessMode != "client" {
+			continue
+		}
+		sub, err := h.repo.GetExternalSubscription(ctx, config.ExternalSubscriptionID, username)
+		if err != nil || sub.ID == 0 {
+			logger.Info("[模板生成] 获取代理集合外部订阅失败", "provider", config.Name, "external_subscription_id", config.ExternalSubscriptionID, "error", err)
+			continue
+		}
+		providerURLs[config.ExternalSubscriptionID] = sub.URL
+	}
+	return providerURLs
+}
+
+func filterProxyProviderConfigs(providerConfigs []storage.ProxyProviderConfig, selectedProviderNames []string) []storage.ProxyProviderConfig {
+	if len(selectedProviderNames) == 0 {
+		return providerConfigs
+	}
+	selected := make(map[string]struct{}, len(selectedProviderNames))
+	for _, name := range selectedProviderNames {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			selected[name] = struct{}{}
+		}
+	}
+	if len(selected) == 0 {
+		return providerConfigs
+	}
+	filtered := make([]storage.ProxyProviderConfig, 0, len(providerConfigs))
+	for _, config := range providerConfigs {
+		if _, ok := selected[config.Name]; ok {
+			filtered = append(filtered, config)
+		}
+	}
+	return filtered
+}
+
+func filterUsableClientProxyProviders(providerConfigs []storage.ProxyProviderConfig, providerURLs map[int64]string) []storage.ProxyProviderConfig {
+	filtered := make([]storage.ProxyProviderConfig, 0, len(providerConfigs))
+	for _, config := range providerConfigs {
+		if config.ProcessMode != "" && config.ProcessMode != "client" {
+			continue
+		}
+		if strings.TrimSpace(providerURLs[config.ExternalSubscriptionID]) == "" {
+			continue
+		}
+		filtered = append(filtered, config)
+	}
+	return filtered
+}
+
+func processProviderOnlyV3Template(templateContent string, providerConfigs []storage.ProxyProviderConfig, providerURLs map[int64]string) (string, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
+		return "", err
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return "", errors.New("expected YAML mapping document")
+	}
+
+	var clientConfigs []storage.ProxyProviderConfig
+	var providerNames []string
+	for _, config := range providerConfigs {
+		if config.ProcessMode != "" && config.ProcessMode != "client" {
+			continue
+		}
+		if strings.TrimSpace(providerURLs[config.ExternalSubscriptionID]) == "" {
+			continue
+		}
+		clientConfigs = append(clientConfigs, config)
+		providerNames = append(providerNames, config.Name)
+	}
+
+	rootMap := root.Content[0]
+	injectClientProxyProviders(rootMap, clientConfigs, providerURLs)
+	rewriteProxyGroupsForProviderMode(rootMap, providerNames)
+
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		return "", err
+	}
+	if err := encoder.Close(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.ProxyProviderConfig, providerURLs map[int64]string) {
+	var proxyProvidersNode *yaml.Node
+	for i := 0; i < len(rootMap.Content)-1; i += 2 {
+		if rootMap.Content[i].Value == "proxy-providers" && rootMap.Content[i+1].Kind == yaml.MappingNode {
+			proxyProvidersNode = rootMap.Content[i+1]
+			break
+		}
+	}
+	if proxyProvidersNode == nil {
+		proxyProvidersNode = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		rootMap.Content = append(rootMap.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "proxy-providers"},
+			proxyProvidersNode,
+		)
+	}
+
+	for _, config := range providerConfigs {
+		providerURL := strings.TrimSpace(providerURLs[config.ExternalSubscriptionID])
+		if providerURL == "" {
+			continue
+		}
+		providerNode := createClientProxyProviderYAMLNode(&config, providerURL)
+		replaced := false
+		for i := 0; i < len(proxyProvidersNode.Content)-1; i += 2 {
+			if proxyProvidersNode.Content[i].Value == config.Name {
+				proxyProvidersNode.Content[i+1] = providerNode
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			proxyProvidersNode.Content = append(proxyProvidersNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: config.Name},
+				providerNode,
+			)
+		}
+	}
+}
+
+func createClientProxyProviderYAMLNode(config *storage.ProxyProviderConfig, providerURL string) *yaml.Node {
+	node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	addScalar := func(key, value string) {
+		if value == "" {
+			return
+		}
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+		)
+	}
+	addInt := func(key string, value int) {
+		if value <= 0 {
+			return
+		}
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(value)},
+		)
+	}
+
+	providerType := config.Type
+	if providerType == "" {
+		providerType = "http"
+	}
+	addScalar("type", providerType)
+	addScalar("url", providerURL)
+	addInt("interval", config.Interval)
+	addScalar("proxy", config.Proxy)
+	addInt("size-limit", config.SizeLimit)
+
+	if config.Header != "" {
+		var header map[string]any
+		if err := json.Unmarshal([]byte(config.Header), &header); err == nil {
+			headerNode := anyToYAMLNode(header)
+			node.Content = append(node.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "header"},
+				headerNode,
+			)
+		}
+	}
+	if config.Filter != "" {
+		addScalar("filter", config.Filter)
+	}
+	if config.ExcludeFilter != "" {
+		addScalar("exclude-filter", config.ExcludeFilter)
+	}
+	if config.ExcludeType != "" {
+		addScalar("exclude-type", config.ExcludeType)
+	}
+	if config.HealthCheckEnabled {
+		healthCheck := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		addHealthScalar := func(key, value string) {
+			if value == "" {
+				return
+			}
+			healthCheck.Content = append(healthCheck.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+			)
+		}
+		addHealthInt := func(key string, value int) {
+			if value <= 0 {
+				return
+			}
+			healthCheck.Content = append(healthCheck.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(value)},
+			)
+		}
+		healthCheck.Content = append(healthCheck.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "enable"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+		)
+		addHealthScalar("url", config.HealthCheckURL)
+		addHealthInt("interval", config.HealthCheckInterval)
+		addHealthInt("timeout", config.HealthCheckTimeout)
+		if config.HealthCheckLazy {
+			healthCheck.Content = append(healthCheck.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "lazy"},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+			)
+		}
+		addHealthInt("expected-status", config.HealthCheckExpectedStatus)
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "health-check"},
+			healthCheck,
+		)
+	}
+	if config.Override != "" {
+		var override map[string]any
+		if err := json.Unmarshal([]byte(config.Override), &override); err == nil {
+			overrideNode := anyToYAMLNode(override)
+			node.Content = append(node.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "override"},
+				overrideNode,
+			)
+		}
+	}
+	return node
+}
+
+func rewriteProxyGroupsForProviderMode(rootMap *yaml.Node, providerNames []string) {
+	if len(providerNames) == 0 {
+		return
+	}
+	for i := 0; i < len(rootMap.Content)-1; i += 2 {
+		if rootMap.Content[i].Value != "proxy-groups" || rootMap.Content[i+1].Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, groupNode := range rootMap.Content[i+1].Content {
+			if groupNode.Kind == yaml.MappingNode {
+				rewriteProviderModeGroup(groupNode, providerNames)
+			}
+		}
+	}
+}
+
+func rewriteProviderModeGroup(groupNode *yaml.Node, providerNames []string) {
+	useNames := make([]string, 0)
+	addUse := func(name string) {
+		if name == "" {
+			return
+		}
+		for _, existing := range useNames {
+			if existing == name {
+				return
+			}
+		}
+		useNames = append(useNames, name)
+	}
+	addAllProviders := func() {
+		for _, name := range providerNames {
+			addUse(name)
+		}
+	}
+
+	newContent := make([]*yaml.Node, 0, len(groupNode.Content))
+	for i := 0; i < len(groupNode.Content)-1; i += 2 {
+		keyNode := groupNode.Content[i]
+		valueNode := groupNode.Content[i+1]
+		switch keyNode.Value {
+		case "use":
+			if valueNode.Kind == yaml.SequenceNode {
+				for _, item := range valueNode.Content {
+					if item.Value == substore.ProxyProvidersMarker {
+						addAllProviders()
+					} else {
+						addUse(item.Value)
+					}
+				}
+			}
+			continue
+		case "include-all", "include-all-providers":
+			if valueNode.Value == "true" {
+				addAllProviders()
+			}
+			continue
+		case "proxies":
+			if valueNode.Kind == yaml.SequenceNode {
+				filtered := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+				for _, item := range valueNode.Content {
+					if item.Value == substore.ProxyProvidersMarker {
+						addAllProviders()
+						continue
+					}
+					if item.Value == substore.ProxyNodesMarker {
+						continue
+					}
+					filtered.Content = append(filtered.Content, item)
+				}
+				if len(filtered.Content) > 0 {
+					newContent = append(newContent, keyNode, filtered)
+				}
+			}
+			continue
+		case "include-all-proxies", "include-type", "exclude-type":
+			continue
+		}
+		newContent = append(newContent, keyNode, valueNode)
+	}
+
+	if len(useNames) > 0 {
+		useNode := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		for _, name := range useNames {
+			useNode.Content = append(useNode.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: name})
+		}
+		newContent = append(newContent,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "use"},
+			useNode,
+		)
+	}
+	groupNode.Content = newContent
 }
 
 // createSubInfoNodes creates subscription info nodes (expire time and remaining traffic)

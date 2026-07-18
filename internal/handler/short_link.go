@@ -75,12 +75,15 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 		return false
 	}
 
-	// 使用真实文件与用户token转发订阅请求
+	// 使用真实文件与用户token转发订阅请求；透传 t 与 mode
 	newURL := *r.URL
 	q := newURL.Query()
 	q.Set("filename", filename)
 	if clientType := r.URL.Query().Get("t"); clientType != "" {
 		q.Set("t", clientType)
+	}
+	if mode := r.URL.Query().Get("mode"); mode != "" {
+		q.Set("mode", mode)
 	}
 	newURL.RawQuery = q.Encode()
 
