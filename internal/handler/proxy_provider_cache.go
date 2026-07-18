@@ -460,6 +460,9 @@ func (s *proxyProviderCacheSyncer) refreshSingle(ctx context.Context, job schedu
 		s.recordFailure(cfg.ID)
 		return
 	}
+	if err := syncProviderNodeTags(runCtx, s.repo, *sub, cfg, entry); err != nil {
+		logger.Warn("[代理集合定时同步] 节点池 Provider 标签同步失败", "config_id", cfg.ID, "name", cfg.Name, "error", err)
+	}
 
 	// 刷新成功，记录日志
 	nodePreview := makeNodePreview(entry.NodeNames, nodeLogPreviewSize)

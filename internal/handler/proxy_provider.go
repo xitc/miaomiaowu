@@ -234,6 +234,9 @@ func handleCreateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 	config.ID = id
 	config.CreatedAt = time.Now()
 	config.UpdatedAt = time.Now()
+	if err := refreshAndSyncProviderNodeTags(r.Context(), repo, sub, *config); err != nil {
+		logger.Warn("[代理集合标签] 新建 Provider 后同步节点标签失败", "provider", config.Name, "error", err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -358,6 +361,11 @@ func handleUpdateProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 
 	config.CreatedAt = existing.CreatedAt
 	config.UpdatedAt = time.Now()
+	if sub, err := repo.GetExternalSubscription(r.Context(), config.ExternalSubscriptionID, username); err != nil {
+		logger.Warn("[代理集合标签] 更新 Provider 后获取外部订阅失败", "provider", config.Name, "error", err)
+	} else if err := refreshAndSyncProviderNodeTags(r.Context(), repo, sub, *config, providerNodeTag(*existing)); err != nil {
+		logger.Warn("[代理集合标签] 更新 Provider 后同步节点标签失败", "provider", config.Name, "error", err)
+	}
 
 	// 检测 ProcessMode 是否发生变化，如果变化则同步更新订阅文件
 	if existing.ProcessMode != processMode {
@@ -383,8 +391,13 @@ func handleDeleteProxyProviderConfig(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 
-	// 删除前先清理缓存（如果是MMW模式）
+	// 删除前先清理缓存和节点池中的 Provider 系统标签。
 	config, err := repo.GetProxyProviderConfig(r.Context(), id)
+	if err == nil && config != nil && config.Username == username {
+		if tagErr := removeProviderNodeTag(r.Context(), repo, username, providerNodeTag(*config)); tagErr != nil {
+			logger.Warn("[代理集合标签] 删除 Provider 时清理节点标签失败", "provider", config.Name, "error", tagErr)
+		}
+	}
 	if err == nil && config != nil && config.ProcessMode == "mmw" {
 		GetProxyProviderCache().Delete(id)
 		logger.Info("[代理集合] 删除配置时清理缓存", "config_id", id, "name", config.Name)

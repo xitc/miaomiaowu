@@ -672,6 +672,18 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 
 	logger.Info("[外部订阅同步] 订阅同步完成", "name", sub.Name, "synced_count", syncedCount, "total_count", len(nodesToUpdate), "updated", updatedCount, "created", createdCount, "skipped", skippedCount)
 
+	// 将每个 Provider 的最终过滤结果映射为节点池系统标签，供普通链接按标签选择。
+	providerConfigs, providerErr := repo.ListProxyProviderConfigsBySubscription(ctx, sub.ID)
+	if providerErr != nil {
+		logger.Warn("[代理集合标签] 获取 Provider 配置失败", "subscription", sub.Name, "error", providerErr)
+	} else {
+		for _, config := range providerConfigs {
+			if err := refreshAndSyncProviderNodeTags(ctx, repo, sub, config); err != nil {
+				logger.Warn("[代理集合标签] 外部订阅同步后刷新标签失败", "provider", config.Name, "error", err)
+			}
+		}
+	}
+
 	// 同步代理集合节点到 YAML（仅处理 mmw 模式）
 	if err := syncProxyProviderNodesToYAML(ctx, repo, subscribeDir, username, sub); err != nil {
 		logger.Info("[外部订阅同步] 同步代理集合节点到YAML失败", "error", err)

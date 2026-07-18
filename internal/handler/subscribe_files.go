@@ -1551,9 +1551,9 @@ func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, user
 			if !node.Enabled {
 				continue
 			}
-			for _, t := range node.Tags {
-				if providerTagSet[t] {
-					providers[t] = append(providers[t], node.NodeName)
+			for _, config := range providerConfigs {
+				if node.HasAnyTag(map[string]bool{config.Name: true, providerNodeTag(config): true}) {
+					providers[config.Name] = append(providers[config.Name], node.NodeName)
 				}
 			}
 		}

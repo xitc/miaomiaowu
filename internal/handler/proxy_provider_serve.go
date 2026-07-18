@@ -205,6 +205,9 @@ func NewProxyProviderServeHandler(repo *storage.TrafficRepository) http.Handler 
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if err := syncProviderNodeTags(r.Context(), repo, sub, *config, entry); err != nil {
+			logger.Warn("[ProxyProviderServe] 节点池 Provider 标签同步失败", "config_id", config.ID, "error", err)
+		}
 
 		// Output directly without download
 		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
