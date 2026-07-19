@@ -290,6 +290,121 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 	return r.GetNode(ctx, node.ID, node.Username)
 }
 
+// UpdateNodeNoFetch updates a node without a follow-up SELECT (for bulk sync paths).
+func (r *TrafficRepository) UpdateNodeNoFetch(ctx context.Context, node Node) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if node.ID <= 0 {
+		return errors.New("node id is required")
+	}
+	node.Username = strings.TrimSpace(node.Username)
+	node.RawURL = strings.TrimSpace(node.RawURL)
+	node.NodeName = strings.TrimSpace(node.NodeName)
+	node.Protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+	node.Tag = strings.TrimSpace(node.Tag)
+	if node.Username == "" {
+		return errors.New("username is required")
+	}
+	if node.RawURL == "" && node.ClashConfig == "" {
+		return errors.New("raw URL or clash config is required")
+	}
+	if node.NodeName == "" {
+		return errors.New("node name is required")
+	}
+	if node.Protocol == "" {
+		return errors.New("protocol is required")
+	}
+	if node.Tag == "" {
+		node.Tag = "手动输入"
+	}
+	if len(node.RelayGroupNodeIDs) > 0 {
+		node.ChainProxyNodeID = nil
+	}
+	if node.ChainProxyNodeID != nil {
+		node.RelayGroupName = ""
+		node.RelayGroupNodeIDs = nil
+	}
+	enabled := 0
+	if node.Enabled {
+		enabled = 1
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, probe_server = ?, chain_proxy_node_id = ?, relay_group_name = ?, relay_group_node_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`,
+		node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, serializeNodeTags(&node), node.OriginalServer, node.ProbeServer, node.ChainProxyNodeID, node.RelayGroupName, serializeRelayGroupNodeIDs(node.RelayGroupNodeIDs), node.ID, node.Username)
+	if err != nil {
+		return fmt.Errorf("update node: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("node update rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNodeNotFound
+	}
+	return nil
+}
+
+// BatchUpdateNodesNoFetch updates many nodes in one transaction without re-fetching rows.
+func (r *TrafficRepository) BatchUpdateNodesNoFetch(ctx context.Context, nodes []Node) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin batch update nodes tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, probe_server = ?, chain_proxy_node_id = ?, relay_group_name = ?, relay_group_node_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare batch update node: %w", err)
+	}
+	defer stmt.Close()
+
+	for idx, node := range nodes {
+		node.Username = strings.TrimSpace(node.Username)
+		node.RawURL = strings.TrimSpace(node.RawURL)
+		node.NodeName = strings.TrimSpace(node.NodeName)
+		node.Protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+		node.Tag = strings.TrimSpace(node.Tag)
+		if node.ID <= 0 || node.Username == "" || node.NodeName == "" || node.Protocol == "" {
+			return fmt.Errorf("batch update node %d: invalid fields", idx+1)
+		}
+		if node.Tag == "" {
+			node.Tag = "手动输入"
+		}
+		if len(node.RelayGroupNodeIDs) > 0 {
+			node.ChainProxyNodeID = nil
+		}
+		if node.ChainProxyNodeID != nil {
+			node.RelayGroupName = ""
+			node.RelayGroupNodeIDs = nil
+		}
+		enabled := 0
+		if node.Enabled {
+			enabled = 1
+		}
+		res, err := stmt.ExecContext(ctx, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, serializeNodeTags(&node), node.OriginalServer, node.ProbeServer, node.ChainProxyNodeID, node.RelayGroupName, serializeRelayGroupNodeIDs(node.RelayGroupNodeIDs), node.ID, node.Username)
+		if err != nil {
+			return fmt.Errorf("batch update node %d: %w", idx+1, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("batch update node %d rows: %w", idx+1, err)
+		}
+		if affected == 0 {
+			return fmt.Errorf("batch update node %d: %w", idx+1, ErrNodeNotFound)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch update nodes: %w", err)
+	}
+	return nil
+}
+
 // DeleteNode removes a proxy node.
 func (r *TrafficRepository) DeleteNode(ctx context.Context, id int64, username string) error {
 	if r == nil || r.db == nil {
@@ -449,6 +564,31 @@ func (r *TrafficRepository) DeleteNodeForSync(ctx context.Context, id int64, use
 
 // BatchCreateNodes creates multiple nodes in a single transaction.
 func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) ([]Node, error) {
+	createdIDs, err := r.batchCreateNodes(ctx, nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preserve the existing API contract for callers that need created rows.
+	created := make([]Node, 0, len(createdIDs))
+	for i, id := range createdIDs {
+		row, err := r.GetNode(ctx, id, nodes[i].Username)
+		if err != nil {
+			return nil, fmt.Errorf("fetch created node %d: %w", i+1, err)
+		}
+		created = append(created, row)
+	}
+	return created, nil
+}
+
+// BatchCreateNodesNoFetch creates many nodes in one transaction without any
+// follow-up SELECT. External subscription sync uses this high-volume path.
+func (r *TrafficRepository) BatchCreateNodesNoFetch(ctx context.Context, nodes []Node) error {
+	_, err := r.batchCreateNodes(ctx, nodes)
+	return err
+}
+
+func (r *TrafficRepository) batchCreateNodes(ctx context.Context, nodes []Node) ([]int64, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
@@ -469,7 +609,7 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 	}
 	defer stmt.Close()
 
-	var createdIDs []int64
+	createdIDs := make([]int64, 0, len(nodes))
 	for idx, node := range nodes {
 		node.Username = strings.TrimSpace(node.Username)
 		node.RawURL = strings.TrimSpace(node.RawURL)
@@ -506,30 +646,17 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 		if err != nil {
 			return nil, fmt.Errorf("insert node %d: %w", idx+1, err)
 		}
-
 		id, err := res.LastInsertId()
 		if err != nil {
 			return nil, fmt.Errorf("fetch node %d id: %w", idx+1, err)
 		}
-
 		createdIDs = append(createdIDs, id)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit batch create nodes: %w", err)
 	}
-
-	// Fetch created nodes
-	var created []Node
-	for i, id := range createdIDs {
-		node, err := r.GetNode(ctx, id, nodes[i].Username)
-		if err != nil {
-			return nil, fmt.Errorf("fetch created node %d: %w", i+1, err)
-		}
-		created = append(created, node)
-	}
-
-	return created, nil
+	return createdIDs, nil
 }
 
 // DeleteAllUserNodes removes all nodes for a specific user.

@@ -342,7 +342,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 非 Clash 原始文件：仅 raw_output 且无模板时直接输出（与 Provider 模式无关）
-	if hasSubscribeFile && subscribeFile.RawOutput && subscribeFile.TemplateFilename == "" {
+	if hasSubscribeFile && subscribeFile.RawOutput && subscribeFile.TemplateFilenameForMode(outputMode) == "" {
 		rawData, readErr := os.ReadFile(resolvedPath)
 		if readErr != nil {
 			if errors.Is(readErr, os.ErrNotExist) {
@@ -381,22 +381,21 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// 模板生成逻辑：如果订阅绑定了 V3 模板，使用模板生成配置
 	var data []byte
 	fromTemplate := false
-	if hasSubscribeFile && subscribeFile.TemplateFilename != "" {
+	templateFilename := ""
+	if hasSubscribeFile {
+		templateFilename = subscribeFile.TemplateFilenameForMode(outputMode)
+	}
+	if hasSubscribeFile && templateFilename != "" {
 		stepStart = time.Now()
-		// Provider 模式必须绑定模板；普通模式也优先走模板
-		if outputMode == storage.OutputModeProvider && strings.TrimSpace(subscribeFile.TemplateFilename) == "" {
-			writeError(w, http.StatusBadRequest, errors.New("Provider 模式必须绑定 v3 模板"))
-			return
-		}
 		templateData, err := h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode)
 		if err != nil {
 			// 不得静默回退到另一种输出模式
 			if outputMode == storage.OutputModeProvider {
-				logger.Info("[Subscription] Provider 模板生成失败", "error", err, "template", subscribeFile.TemplateFilename)
+				logger.Info("[Subscription] Provider 模板生成失败", "error", err, "template", templateFilename)
 				writeError(w, http.StatusInternalServerError, fmt.Errorf("Provider 配置生成失败: %w", err))
 				return
 			}
-			logger.Info("[Subscription] 普通模板生成失败，回退到订阅文件缓存", "error", err, "template", subscribeFile.TemplateFilename)
+			logger.Info("[Subscription] 普通模板生成失败，回退到订阅文件缓存", "error", err, "template", templateFilename)
 			// 普通模式可回退到同模式文件缓存
 		} else {
 			data = templateData
@@ -1305,42 +1304,11 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 	logger.Info("[Subscription] 同步完成", "total_nodes", totalNodesSynced, "subscription_count", len(subsToSync))
 
-	// 同步完成后，失效相关缓存：
-	// 1. 失效外部订阅内容缓存（proxy_provider_serve.go 中的 5 分钟缓存）
-	// 2. 失效代理集合节点缓存
-	// 这样下次获取订阅时会使用最新的节点数据
-	syncedSubIDs := make(map[int64]bool)
-	syncedSubURLs := make(map[string]bool)
-	for _, sub := range subsToSync {
-		syncedSubIDs[sub.ID] = true
-		syncedSubURLs[sub.URL] = true
-	}
-
-	// 失效外部订阅内容缓存
-	for url := range syncedSubURLs {
-		InvalidateSubscriptionContentCache(url)
-		logger.Info("[Subscription] 失效外部订阅内容缓存", "url", url)
-	}
-
-	// 获取所有代理集合配置，失效引用了这些外部订阅的代理集合缓存
-	configs, err := repo.ListProxyProviderConfigs(ctx, username)
-	if err == nil {
-		cache := GetProxyProviderCache()
-		invalidatedCount := 0
-		for _, config := range configs {
-			// 检查是否引用了刚刚同步的外部订阅
-			if syncedSubIDs[config.ExternalSubscriptionID] {
-				cache.Delete(config.ID)
-				invalidatedCount++
-				logger.Info("[Subscription] 失效代理集合缓存", "config_name", config.Name, "config_id", config.ID)
-			}
-		}
-		if invalidatedCount > 0 {
-			logger.Info("[Subscription] 代理集合缓存失效完成", "count", invalidatedCount)
-		}
-	} else {
-		logger.Info("[Subscription] 获取代理集合配置失败，无法失效缓存", "error", err)
-	}
+	// syncSingleExternalSubscription has already primed the shared content cache
+	// with the freshly downloaded payload and rebuilt each derived provider cache.
+	// Keep those entries: deleting them here would discard fresh work and force the
+	// next provider request to download the same upstream subscription again.
+	logger.Info("[Subscription] 保留同步生成的新缓存", "subscription_count", len(subsToSync))
 
 	return nil
 }
@@ -2358,18 +2326,19 @@ func matchesSubscribeNodeSelection(node storage.Node, selectedNodeIDs map[int64]
 // generateFromTemplate 基于绑定的 V3 模板生成订阅配置。
 // outputMode 为 normal（节点/标签）或 provider（proxy-providers / use）。
 func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile, outputMode string) ([]byte, error) {
-	if subscribeFile.TemplateFilename == "" {
+	outputMode = storage.NormalizeDefaultOutputMode(outputMode)
+	templateFilename := subscribeFile.TemplateFilenameForMode(outputMode)
+	if templateFilename == "" {
 		return nil, errors.New("订阅未绑定模板")
 	}
-	outputMode = storage.NormalizeDefaultOutputMode(outputMode)
 
 	// 1. 读取模板文件
-	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
+	templatePath := filepath.Join("rule_templates", templateFilename)
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return nil, fmt.Errorf("读取模板文件失败: %w", err)
 	}
-	logger.Info("[模板生成] 读取模板文件", "template", subscribeFile.TemplateFilename, "bytes", len(templateContent))
+	logger.Info("[模板生成] 读取模板文件", "template", templateFilename, "bytes", len(templateContent))
 
 	// 2. 从节点表获取代理节点（非管理员使用管理员的节点）
 	nodeOwner := username
@@ -2520,7 +2489,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		if err != nil {
 			return nil, fmt.Errorf("处理 Provider 模板失败: %w", err)
 		}
-		logger.Info("[模板生成] Provider 模式模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "providers", len(providerConfigs), "result_bytes", len(result))
+		logger.Info("[模板生成] Provider 模式模板处理完成", "subscribe", subscribeFile.Name, "template", templateFilename, "providers", len(providerConfigs), "result_bytes", len(result))
 		return []byte(result), nil
 	}
 
@@ -2569,7 +2538,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		}
 	}
 
-	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "result_bytes", len(result))
+	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", templateFilename, "result_bytes", len(result))
 
 	return []byte(result), nil
 }

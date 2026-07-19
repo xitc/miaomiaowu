@@ -50,24 +50,51 @@ func TestValidateSubscribeOutputModes(t *testing.T) {
 	}
 	err = ValidateSubscribeOutputModes(SubscribeFile{
 		NormalLinkEnabled: false, ProviderLinkEnabled: true, DefaultOutputMode: OutputModeProvider,
-		TemplateFilename: "x.yaml",
+		ProviderTemplateFilename: "x.yaml",
 	}, 0)
 	if err == nil {
 		t.Fatal("expected client provider required")
 	}
 	err = ValidateSubscribeOutputModes(SubscribeFile{
 		NormalLinkEnabled: false, ProviderLinkEnabled: true, DefaultOutputMode: OutputModeProvider,
-		TemplateFilename: "x.yaml",
+		ProviderTemplateFilename: "x.yaml",
 	}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = ValidateSubscribeOutputModes(SubscribeFile{
 		RawOutput: true, ProviderLinkEnabled: true, NormalLinkEnabled: true,
-		DefaultOutputMode: OutputModeNormal, TemplateFilename: "x.yaml",
+		DefaultOutputMode: OutputModeNormal, NormalTemplateFilename: "normal.yaml", ProviderTemplateFilename: "provider.yaml",
 	}, 1)
 	if err == nil {
 		t.Fatal("raw+provider should fail")
+	}
+}
+
+func TestValidateSubscribeOutputModesRequiresDistinctDualTemplates(t *testing.T) {
+	file := SubscribeFile{
+		NormalLinkEnabled: true, ProviderLinkEnabled: true, DefaultOutputMode: OutputModeNormal,
+		NormalTemplateFilename: "shared.yaml", ProviderTemplateFilename: "shared.yaml",
+	}
+	if err := ValidateSubscribeOutputModes(file, 1); err == nil {
+		t.Fatal("dual mode should reject a shared template")
+	}
+	file.ProviderTemplateFilename = "provider.yaml"
+	if err := ValidateSubscribeOutputModes(file, 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTemplateFilenameForMode(t *testing.T) {
+	file := SubscribeFile{
+		NormalTemplateFilename:   "normal.yaml",
+		ProviderTemplateFilename: "provider.yaml",
+	}
+	if got := file.TemplateFilenameForMode(OutputModeNormal); got != "normal.yaml" {
+		t.Fatalf("normal template = %q", got)
+	}
+	if got := file.TemplateFilenameForMode(OutputModeProvider); got != "provider.yaml" {
+		t.Fatalf("provider template = %q", got)
 	}
 }
 

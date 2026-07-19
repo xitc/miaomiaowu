@@ -52,6 +52,19 @@ func InvalidateSubscriptionContentCache(url string) {
 	subscriptionCache.Delete(url)
 }
 
+// storeSubscriptionContentCache stores freshly fetched raw subscription content.
+// External subscription sync and proxy-provider processing share this cache so a
+// single sync does not download the same upstream payload twice.
+func storeSubscriptionContentCache(url string, content []byte) {
+	if strings.TrimSpace(url) == "" || content == nil {
+		return
+	}
+	subscriptionCache.Store(url, &subscriptionCacheEntry{
+		content:   content,
+		fetchedAt: time.Now(),
+	})
+}
+
 // getGeoIPCountryCode 查询 IP 的国家代码
 func getGeoIPCountryCode(ipOrHost string) string {
 	if ipOrHost == "" {
@@ -265,10 +278,7 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	}
 
 	// 存入缓存
-	subscriptionCache.Store(cacheKey, &subscriptionCacheEntry{
-		content:   body,
-		fetchedAt: time.Now(),
-	})
+	storeSubscriptionContentCache(cacheKey, body)
 
 	return body, nil
 }
@@ -323,7 +333,15 @@ func preprocessSubscriptionContent(content []byte) ([]byte, error) {
 // FetchAndFilterProxiesYAML fetches proxies from external subscription and applies filters
 // Returns YAML bytes preserving original field order with 2-space indentation
 func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storage.ProxyProviderConfig) ([]byte, error) {
-	// Fetch subscription content (with caching)
+	proxiesNode, err := loadSubscriptionProxiesNode(sub)
+	if err != nil {
+		return nil, err
+	}
+	yamlBytes, _, err := buildFilteredProxiesYAML(proxiesNode, config)
+	return yamlBytes, err
+}
+
+func loadSubscriptionProxiesNode(sub *storage.ExternalSubscription) (*yaml.Node, error) {
 	body, err := fetchSubscriptionContent(sub)
 	if err != nil {
 		return nil, err
@@ -346,9 +364,35 @@ func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storag
 	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("no proxies found in subscription")
 	}
+	return proxiesNode, nil
+}
+
+// cloneYAMLNode isolates provider-specific filters, overrides and field reordering
+// from the shared source parse tree.
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	cloned := *node
+	if len(node.Content) > 0 {
+		cloned.Content = make([]*yaml.Node, len(node.Content))
+		for i, child := range node.Content {
+			cloned.Content[i] = cloneYAMLNode(child)
+		}
+	}
+	return &cloned
+}
+
+// buildFilteredProxiesYAML applies one provider configuration to an already
+// parsed source tree. It returns both encoded YAML and decoded provider nodes so
+// callers do not need to parse the generated YAML again.
+func buildFilteredProxiesYAML(sourceProxiesNode *yaml.Node, config *storage.ProxyProviderConfig) ([]byte, []any, error) {
+	if sourceProxiesNode == nil || sourceProxiesNode.Kind != yaml.SequenceNode {
+		return nil, nil, fmt.Errorf("no proxies found in subscription")
+	}
 
 	// Apply filters to proxies node
-	filteredProxiesNode := applyFiltersToNode(proxiesNode, config)
+	filteredProxiesNode := applyFiltersToNode(cloneYAMLNode(sourceProxiesNode), config)
 
 	// Apply overrides to proxies node
 	if config.Override != "" {
@@ -381,7 +425,12 @@ func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storag
 	reorderProxiesNode(filteredProxiesNode)
 
 	if err := validateUniqueProxyNames(filteredProxiesNode); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+
+	var proxiesRaw []any
+	if err := filteredProxiesNode.Decode(&proxiesRaw); err != nil {
+		return nil, nil, fmt.Errorf("decode filtered proxies: %w", err)
 	}
 
 	// Build output document
@@ -406,13 +455,13 @@ func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storag
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
 	if err := encoder.Encode(outputDoc); err != nil {
-		return nil, fmt.Errorf("encode yaml: %w", err)
+		return nil, nil, fmt.Errorf("encode yaml: %w", err)
 	}
 	encoder.Close()
 
 	// Fix emoji escapes and quoted numbers
 	result := RemoveUnicodeEscapeQuotes(buf.String())
-	return []byte(result), nil
+	return []byte(result), proxiesRaw, nil
 }
 
 func validateUniqueProxyNames(proxiesNode *yaml.Node) error {
@@ -885,10 +934,18 @@ func createEmptyCacheEntry(sub *storage.ExternalSubscription, config *storage.Pr
 
 // RefreshProxyProviderCache 刷新代理集合缓存
 func RefreshProxyProviderCache(sub *storage.ExternalSubscription, config *storage.ProxyProviderConfig) (*CacheEntry, error) {
-	// 拉取并过滤节点
-	yamlBytes, err := FetchAndFilterProxiesYAML(sub, config)
+	proxiesNode, err := loadSubscriptionProxiesNode(sub)
 	if err != nil {
 		return nil, fmt.Errorf("fetch and filter proxies: %w", err)
+	}
+	return refreshProxyProviderCacheFromNode(sub, config, proxiesNode)
+}
+
+func refreshProxyProviderCacheFromNode(sub *storage.ExternalSubscription, config *storage.ProxyProviderConfig, proxiesNode *yaml.Node) (*CacheEntry, error) {
+	// Filter the shared source tree and decode the result without reparsing YAML.
+	yamlBytes, proxiesRaw, err := buildFilteredProxiesYAML(proxiesNode, config)
+	if err != nil {
+		return nil, fmt.Errorf("filter proxies: %w", err)
 	}
 
 	// 检查返回内容是否为空
@@ -900,23 +957,7 @@ func RefreshProxyProviderCache(sub *storage.ExternalSubscription, config *storag
 		return entry, nil
 	}
 
-	// 解析 YAML 获取节点列表
-	var result map[string]any
-	if err := yaml.Unmarshal(yamlBytes, &result); err != nil {
-		// YAML 解析失败，记录日志并返回空缓存（而不是报错）
-		contentPreview := string(yamlBytes)
-		if len(contentPreview) > 200 {
-			contentPreview = contentPreview[:200] + "..."
-		}
-		logger.Info("[RefreshProxyProviderCache] YAML解析失败", "config_id", config.ID, "error", err, "content_preview", contentPreview)
-		entry := createEmptyCacheEntry(sub, config)
-		cache := GetProxyProviderCache()
-		cache.Set(config.ID, entry)
-		return entry, nil
-	}
-
-	proxiesRaw, ok := result["proxies"].([]any)
-	if !ok {
+	if proxiesRaw == nil {
 		proxiesRaw = []any{}
 	}
 

@@ -114,14 +114,18 @@ func reconcileProviderNodeTags(nodes []storage.Node, sourceURL, addTag string, s
 			endpoints[identity.endpoint] = true
 		}
 	}
-	removeTags := make(map[string]bool, len(staleTags)+1)
-	removeTags[addTag] = true
+	staleOnly := make(map[string]bool, len(staleTags))
 	for _, tag := range staleTags {
-		removeTags[tag] = true
+		if tag != "" && tag != addTag {
+			staleOnly[tag] = true
+		}
 	}
 
 	changedNodes := make([]storage.Node, 0)
 	for _, node := range nodes {
+		// A provider sync is source-local. Cross-source cleanup must be a
+		// separate, backed-up maintenance operation; never mutate another
+		// subscription as a side effect of this sync.
 		if node.RawURL != sourceURL {
 			continue
 		}
@@ -129,8 +133,19 @@ func reconcileProviderNodeTags(nodes []storage.Node, sourceURL, addTag string, s
 		var proxy map[string]any
 		_ = json.Unmarshal([]byte(node.ClashConfig), &proxy)
 		identity := proxyIdentity(proxy)
-		matched := names[node.NodeName] || names[identity.name] || (identity.endpoint != "" && endpoints[identity.endpoint])
-		nextTags, changed := updateProviderTags(node.Tags, removeTags, addTag, matched)
+
+		shouldHave := names[node.NodeName] || names[identity.name] || (identity.endpoint != "" && endpoints[identity.endpoint])
+
+		removeTags := make(map[string]bool, len(staleOnly)+1)
+		for tag := range staleOnly {
+			removeTags[tag] = true
+		}
+		if !shouldHave {
+			// Drop addTag when node is not in the final provider set (or wrong source).
+			removeTags[addTag] = true
+		}
+		// Idempotent: if shouldHave and tag already present, do not remove+readd.
+		nextTags, changed := updateProviderTags(node.Tags, removeTags, addTag, shouldHave)
 		if !changed {
 			continue
 		}
@@ -146,11 +161,9 @@ func reconcileProviderNodeTags(nodes []storage.Node, sourceURL, addTag string, s
 }
 
 func missingProviderNodes(nodes []storage.Node, sub storage.ExternalSubscription, tag string, providerNodes []any) []storage.Node {
-	existingNames := make(map[string]bool, len(nodes))
 	existingSourceNames := make(map[string]bool)
 	existingSourceEndpoints := make(map[string]bool)
 	for _, node := range nodes {
-		existingNames[node.NodeName] = true
 		if node.RawURL != sub.URL {
 			continue
 		}
@@ -176,11 +189,6 @@ func missingProviderNodes(nodes []storage.Node, sub storage.ExternalSubscription
 		if identity.name == "" || existingSourceNames[identity.name] || (identity.endpoint != "" && existingSourceEndpoints[identity.endpoint]) {
 			continue
 		}
-		// Avoid introducing duplicate proxy names across different sources. Such a
-		// node remains available through its existing pool entry.
-		if existingNames[identity.name] {
-			continue
-		}
 		clashConfig, err := json.Marshal(proxy)
 		if err != nil {
 			continue
@@ -201,7 +209,6 @@ func missingProviderNodes(nodes []storage.Node, sub storage.ExternalSubscription
 			Tag:          tags[0],
 			Tags:         tags,
 		})
-		existingNames[identity.name] = true
 		existingSourceNames[identity.name] = true
 		if identity.endpoint != "" {
 			existingSourceEndpoints[identity.endpoint] = true
@@ -221,23 +228,24 @@ func syncProviderNodeTags(ctx context.Context, repo *storage.TrafficRepository, 
 		return fmt.Errorf("list nodes for provider tags: %w", err)
 	}
 	changed := reconcileProviderNodeTags(nodes, sub.URL, providerNodeTag(config), staleTags, entry.Nodes)
-	for _, node := range changed {
-		if _, err := repo.UpdateNode(ctx, node); err != nil {
-			return fmt.Errorf("update provider tag for node %d: %w", node.ID, err)
-		}
+	if err := repo.BatchUpdateNodesNoFetch(ctx, changed); err != nil {
+		return fmt.Errorf("batch update provider tags: %w", err)
 	}
-	created := 0
-	for _, node := range missingProviderNodes(nodes, sub, providerNodeTag(config), entry.Nodes) {
+	missing := missingProviderNodes(nodes, sub, providerNodeTag(config), entry.Nodes)
+	validMissing := make([]storage.Node, 0, len(missing))
+	for _, node := range missing {
 		if strings.TrimSpace(node.Protocol) == "" {
 			logger.Warn("[代理集合标签] Provider 节点缺少协议，跳过载入节点池", "provider", config.Name, "node", node.NodeName)
 			continue
 		}
-		if _, err := repo.CreateNode(ctx, node); err != nil {
-			return fmt.Errorf("create provider node %q: %w", node.NodeName, err)
-		}
-		created++
+		validMissing = append(validMissing, node)
 	}
-	logger.Info("[代理集合标签] 已同步 Provider 节点标签", "provider", config.Name, "tag", providerNodeTag(config), "matched_nodes", entry.NodeCount, "updated_nodes", len(changed), "created_nodes", created)
+	if len(validMissing) > 0 {
+		if err := repo.BatchCreateNodesNoFetch(ctx, validMissing); err != nil {
+			return fmt.Errorf("batch create provider nodes: %w", err)
+		}
+	}
+	logger.Info("[代理集合标签] 已同步 Provider 节点标签", "provider", config.Name, "tag", providerNodeTag(config), "matched_nodes", entry.NodeCount, "updated_nodes", len(changed), "created_nodes", len(validMissing))
 	return nil
 }
 

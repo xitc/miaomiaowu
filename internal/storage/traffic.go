@@ -237,7 +237,9 @@ type SubscribeFile struct {
 	AutoSyncCustomRules       bool       // Whether to automatically sync custom rules to this file
 	SelectedCustomRuleIDs     []int64    // 选中的自定义规则 ID，为空且开启覆写时表示应用全部已启用规则
 	SelectedOverrideScriptIDs []int64    // 选中的覆写脚本 ID，为空且开启覆写时表示应用全部已启用脚本
-	TemplateFilename          string     // 绑定的 V3 模板文件名，为空表示未绑定模板
+	TemplateFilename          string     // 旧版模板字段，仅用于 API/数据迁移兼容
+	NormalTemplateFilename    string     // 普通链接绑定的 V3 模板文件名
+	ProviderTemplateFilename  string     // Provider 链接绑定的 V3 模板文件名
 	SelectedTags              []string   // 选中的节点标签，为空表示使用所有节点(legacy,与 SelectedNodeIDs 二选一)
 	SelectedNodeIDs           []int64    // 选中的节点 ID,非空时优先于 SelectedTags 过滤
 	SelectedProviderNames     []string   // Provider 模式下选中的 proxy-provider 名称，为空表示全部 client provider
@@ -1107,7 +1109,6 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 	if err := r.ensureSubscribeFileColumn("template_filename", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-
 	// Dual-mode link flags must run after template_filename exists (migration filters on it).
 	if err := r.ensureSubscribeOutputModeColumns(); err != nil {
 		return err
@@ -2080,6 +2081,31 @@ WHERE COALESCE(raw_output, 0) = 1
 		return fmt.Errorf("migrate legacy provider-mode subscribe files: %w", err)
 	}
 
+	return r.ensureSubscribeTemplateColumns()
+}
+
+// ensureSubscribeTemplateColumns splits the legacy shared template binding by output mode.
+// Existing rows are copied without changing their current output. Dual-mode rows therefore
+// initially receive the legacy template in both columns and can be explicitly reassigned later.
+func (r *TrafficRepository) ensureSubscribeTemplateColumns() error {
+	if err := r.ensureSubscribeFileColumn("normal_template_filename", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("provider_template_filename", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := r.db.Exec(`
+UPDATE subscribe_files
+SET normal_template_filename = CASE
+        WHEN COALESCE(normal_template_filename, '') = '' AND COALESCE(normal_link_enabled, 1) = 1
+        THEN COALESCE(template_filename, '') ELSE normal_template_filename END,
+    provider_template_filename = CASE
+        WHEN COALESCE(provider_template_filename, '') = '' AND COALESCE(provider_link_enabled, 0) = 1
+        THEN COALESCE(template_filename, '') ELSE provider_template_filename END
+WHERE COALESCE(template_filename, '') != ''
+`); err != nil {
+		return fmt.Errorf("migrate split subscribe templates: %w", err)
+	}
 	return nil
 }
 
@@ -3716,7 +3742,7 @@ func (r *TrafficRepository) GetUserSubscriptions(ctx context.Context, username s
 	}
 
 	stmt := `
-		SELECT s.id, s.name, COALESCE(s.description, ''), COALESCE(s.url, ''), s.type, s.filename, COALESCE(s.file_short_code, ''), COALESCE(s.custom_short_code, ''), COALESCE(s.auto_sync_custom_rules, 0), COALESCE(s.template_filename, ''), COALESCE(s.sort_order, 0), s.expire_at, s.created_at, s.updated_at,
+		SELECT s.id, s.name, COALESCE(s.description, ''), COALESCE(s.url, ''), s.type, s.filename, COALESCE(s.file_short_code, ''), COALESCE(s.custom_short_code, ''), COALESCE(s.auto_sync_custom_rules, 0), COALESCE(s.template_filename, ''), COALESCE(s.normal_template_filename, ''), COALESCE(s.provider_template_filename, ''), COALESCE(s.sort_order, 0), s.expire_at, s.created_at, s.updated_at,
 			COALESCE(s.raw_output, 0), COALESCE(s.normal_link_enabled, 1), COALESCE(s.provider_link_enabled, 0), COALESCE(s.default_output_mode, 'normal')
 		FROM subscribe_files s
 		INNER JOIN user_subscriptions us ON s.id = us.subscription_id
@@ -3736,7 +3762,7 @@ func (r *TrafficRepository) GetUserSubscriptions(ctx context.Context, username s
 		var expireAt sql.NullTime
 		var rawOutput, normalLink, providerLink int
 		var defaultMode string
-		if err := rows.Scan(&sub.ID, &sub.Name, &sub.Description, &sub.URL, &sub.Type, &sub.Filename, &sub.FileShortCode, &sub.CustomShortCode, &autoSync, &sub.TemplateFilename, &sub.SortOrder, &expireAt, &sub.CreatedAt, &sub.UpdatedAt, &rawOutput, &normalLink, &providerLink, &defaultMode); err != nil {
+		if err := rows.Scan(&sub.ID, &sub.Name, &sub.Description, &sub.URL, &sub.Type, &sub.Filename, &sub.FileShortCode, &sub.CustomShortCode, &autoSync, &sub.TemplateFilename, &sub.NormalTemplateFilename, &sub.ProviderTemplateFilename, &sub.SortOrder, &expireAt, &sub.CreatedAt, &sub.UpdatedAt, &rawOutput, &normalLink, &providerLink, &defaultMode); err != nil {
 			return nil, fmt.Errorf("scan subscription: %w", err)
 		}
 		sub.AutoSyncCustomRules = autoSync != 0
@@ -4470,7 +4496,7 @@ func (r *TrafficRepository) GetSubscribeFilesWithAutoSync(ctx context.Context) (
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	const query = `SELECT id, name, COALESCE(description, ''), url, type, filename, COALESCE(file_short_code, ''), auto_sync_custom_rules, COALESCE(template_filename, ''), COALESCE(sort_order, 0), expire_at, created_at, updated_at
+	const query = `SELECT id, name, COALESCE(description, ''), url, type, filename, COALESCE(file_short_code, ''), auto_sync_custom_rules, COALESCE(template_filename, ''), COALESCE(normal_template_filename, ''), COALESCE(provider_template_filename, ''), COALESCE(sort_order, 0), expire_at, created_at, updated_at
 		FROM subscribe_files
 		WHERE auto_sync_custom_rules = 1
 		ORDER BY sort_order ASC, created_at DESC`
@@ -4486,7 +4512,7 @@ func (r *TrafficRepository) GetSubscribeFilesWithAutoSync(ctx context.Context) (
 		var file SubscribeFile
 		var autoSync int
 		var expireAt sql.NullTime
-		if err := rows.Scan(&file.ID, &file.Name, &file.Description, &file.URL, &file.Type, &file.Filename, &file.FileShortCode, &autoSync, &file.TemplateFilename, &file.SortOrder, &expireAt, &file.CreatedAt, &file.UpdatedAt); err != nil {
+		if err := rows.Scan(&file.ID, &file.Name, &file.Description, &file.URL, &file.Type, &file.Filename, &file.FileShortCode, &autoSync, &file.TemplateFilename, &file.NormalTemplateFilename, &file.ProviderTemplateFilename, &file.SortOrder, &expireAt, &file.CreatedAt, &file.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan subscribe file: %w", err)
 		}
 		file.AutoSyncCustomRules = autoSync != 0

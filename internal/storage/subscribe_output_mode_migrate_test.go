@@ -91,9 +91,15 @@ CREATE TABLE subscribe_files (
 	if !p.ProviderLinkEnabled || p.NormalLinkEnabled || p.RawOutput || p.DefaultOutputMode != OutputModeProvider {
 		t.Fatalf("provider-sub migration wrong: %+v", p)
 	}
+	if p.ProviderTemplateFilename != "bobo_provider.yaml" || p.NormalTemplateFilename != "" {
+		t.Fatalf("provider template migration wrong: %+v", p)
+	}
 	n := byName["normal-sub"]
 	if !n.NormalLinkEnabled || n.ProviderLinkEnabled || n.DefaultOutputMode != OutputModeNormal {
 		t.Fatalf("normal-sub migration wrong: %+v", n)
+	}
+	if n.NormalTemplateFilename != "my-provider-v3.yaml" || n.ProviderTemplateFilename != "" {
+		t.Fatalf("normal template migration wrong: %+v", n)
 	}
 	r := byName["raw-sub"]
 	if !r.RawOutput || !r.NormalLinkEnabled || r.ProviderLinkEnabled {

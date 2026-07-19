@@ -501,11 +501,31 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	}
 	templateJustBound := false
 	tagsChanged := false
-	if req.TemplateFilename != nil {
-		existing.TemplateFilename = *req.TemplateFilename
-		if *req.TemplateFilename != "" {
+	if req.NormalTemplateFilename != nil {
+		existing.NormalTemplateFilename = strings.TrimSpace(*req.NormalTemplateFilename)
+		templateJustBound = existing.NormalTemplateFilename != ""
+	}
+	if req.ProviderTemplateFilename != nil {
+		existing.ProviderTemplateFilename = strings.TrimSpace(*req.ProviderTemplateFilename)
+	}
+	if req.TemplateFilename != nil && req.NormalTemplateFilename == nil && req.ProviderTemplateFilename == nil {
+		// Legacy clients only know one template field. Apply it to the enabled mode;
+		// dual-mode records must use the two explicit fields and pass validation below.
+		existing.TemplateFilename = strings.TrimSpace(*req.TemplateFilename)
+		if existing.NormalLinkEnabled && req.NormalTemplateFilename == nil {
+			existing.NormalTemplateFilename = existing.TemplateFilename
+		}
+		if existing.ProviderLinkEnabled && req.ProviderTemplateFilename == nil {
+			existing.ProviderTemplateFilename = existing.TemplateFilename
+		}
+		if existing.TemplateFilename != "" {
 			templateJustBound = true
 		}
+	}
+	if existing.NormalTemplateFilename != "" {
+		existing.TemplateFilename = existing.NormalTemplateFilename
+	} else {
+		existing.TemplateFilename = existing.ProviderTemplateFilename
 	}
 	// 更新选中的节点标签(legacy) — 与 Provider 选择独立保存，互不因开关清空
 	if req.SelectedTags != nil {
@@ -631,7 +651,7 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 
 	// 普通链接模式：绑定模板 / 节点筛选 / 模式变化时写回 subscribes/<filename>
 	// Provider 模式按请求动态生成，不写入共享订阅文件，避免与普通产物互相覆盖。
-	if (templateJustBound || tagsChanged || rawOutputChanged || linkModeChanged) && updated.TemplateFilename != "" && updated.NormalLinkEnabled {
+	if (templateJustBound || tagsChanged || rawOutputChanged || linkModeChanged) && updated.NormalTemplateFilename != "" && updated.NormalLinkEnabled {
 		go func() {
 			ctx := context.Background()
 			username := auth.UsernameFromContext(r.Context())
@@ -640,9 +660,9 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 				return
 			}
 			if err := h.regenerateFromTemplate(ctx, username, updated); err != nil {
-				logger.Info("[模板生成] 生成失败", "subscribe_id", updated.ID, "template", updated.TemplateFilename, "error", err)
+				logger.Info("[模板生成] 生成失败", "subscribe_id", updated.ID, "template", updated.NormalTemplateFilename, "error", err)
 			} else {
-				logger.Info("[模板生成] 生成成功", "subscribe_id", updated.ID, "template", updated.TemplateFilename)
+				logger.Info("[模板生成] 生成成功", "subscribe_id", updated.ID, "template", updated.NormalTemplateFilename)
 			}
 		}()
 	}
@@ -727,6 +747,8 @@ type subscribeFileRequest struct {
 	SelectedCustomRuleIDs     []int64  `json:"selected_custom_rule_ids,omitempty"`
 	SelectedOverrideScriptIDs []int64  `json:"selected_override_script_ids,omitempty"`
 	TemplateFilename          *string  `json:"template_filename,omitempty"`
+	NormalTemplateFilename    *string  `json:"normal_template_filename,omitempty"`
+	ProviderTemplateFilename  *string  `json:"provider_template_filename,omitempty"`
 	SelectedTags              []string `json:"selected_tags,omitempty"`
 	SelectedNodeIDs           []int64  `json:"selected_node_ids,omitempty"`
 	SelectedProviderNames     []string `json:"selected_provider_names,omitempty"`
@@ -740,6 +762,15 @@ type subscribeFileRequest struct {
 	StatsServerIDs            *string  `json:"stats_server_ids,omitempty"`
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 type subscribeFileDTO struct {
 	ID                        int64      `json:"id"`
 	Name                      string     `json:"name"`
@@ -751,6 +782,8 @@ type subscribeFileDTO struct {
 	SelectedCustomRuleIDs     []int64    `json:"selected_custom_rule_ids"`
 	SelectedOverrideScriptIDs []int64    `json:"selected_override_script_ids"`
 	TemplateFilename          string     `json:"template_filename"`
+	NormalTemplateFilename    string     `json:"normal_template_filename"`
+	ProviderTemplateFilename  string     `json:"provider_template_filename"`
 	SelectedTags              []string   `json:"selected_tags"`
 	SelectedNodeIDs           []int64    `json:"selected_node_ids"`
 	SelectedProviderNames     []string   `json:"selected_provider_names"`
@@ -798,6 +831,8 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		SelectedCustomRuleIDs:     ruleIDs,
 		SelectedOverrideScriptIDs: scriptIDs,
 		TemplateFilename:          file.TemplateFilename,
+		NormalTemplateFilename:    file.NormalTemplateFilename,
+		ProviderTemplateFilename:  file.ProviderTemplateFilename,
 		SelectedTags:              selectedTags,
 		SelectedNodeIDs:           selectedNodeIDs,
 		SelectedProviderNames:     selectedProviderNames,
@@ -859,16 +894,18 @@ func parseExpireAt(raw *string) (*time.Time, error) {
 // handleCreateFromConfig 保存生成的配置为订阅文件
 func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name                  string   `json:"name"`
-		Description           string   `json:"description"`
-		Filename              string   `json:"filename"`
-		Content               string   `json:"content"`
-		TemplateFilename      string   `json:"template_filename"` // V3 模板文件名
-		SelectedTags          []string `json:"selected_tags"`     // V3 legacy:按标签选节点
-		SelectedNodeIDs       []int64  `json:"selected_node_ids"` // V3 新:按节点 ID 精确选;非空优先于 SelectedTags
-		SelectedProviderNames []string `json:"selected_provider_names"`
-		TrafficLimit          *float64 `json:"traffic_limit"`
-		StatsServerIDs        string   `json:"stats_server_ids"`
+		Name                     string   `json:"name"`
+		Description              string   `json:"description"`
+		Filename                 string   `json:"filename"`
+		Content                  string   `json:"content"`
+		TemplateFilename         string   `json:"template_filename"` // 旧版兼容字段
+		NormalTemplateFilename   string   `json:"normal_template_filename"`
+		ProviderTemplateFilename string   `json:"provider_template_filename"`
+		SelectedTags             []string `json:"selected_tags"`     // V3 legacy:按标签选节点
+		SelectedNodeIDs          []int64  `json:"selected_node_ids"` // V3 新:按节点 ID 精确选;非空优先于 SelectedTags
+		SelectedProviderNames    []string `json:"selected_provider_names"`
+		TrafficLimit             *float64 `json:"traffic_limit"`
+		StatsServerIDs           string   `json:"stats_server_ids"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1004,17 +1041,19 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 
 	// 保存到数据库
 	file := storage.SubscribeFile{
-		Name:                  req.Name,
-		Description:           req.Description,
-		URL:                   "",
-		Type:                  storage.SubscribeTypeCreate,
-		Filename:              filename,
-		TemplateFilename:      req.TemplateFilename,
-		SelectedTags:          req.SelectedTags,
-		SelectedNodeIDs:       req.SelectedNodeIDs,
-		SelectedProviderNames: req.SelectedProviderNames,
-		TrafficLimit:          req.TrafficLimit,
-		StatsServerIDs:        req.StatsServerIDs,
+		Name:                     req.Name,
+		Description:              req.Description,
+		URL:                      "",
+		Type:                     storage.SubscribeTypeCreate,
+		Filename:                 filename,
+		TemplateFilename:         req.TemplateFilename,
+		NormalTemplateFilename:   firstNonEmpty(req.NormalTemplateFilename, req.TemplateFilename),
+		ProviderTemplateFilename: req.ProviderTemplateFilename,
+		SelectedTags:             req.SelectedTags,
+		SelectedNodeIDs:          req.SelectedNodeIDs,
+		SelectedProviderNames:    req.SelectedProviderNames,
+		TrafficLimit:             req.TrafficLimit,
+		StatsServerIDs:           req.StatsServerIDs,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
@@ -1447,17 +1486,18 @@ func copyMap(m map[string]any) map[string]any {
 
 // regenerateFromTemplate 从V3模板重新生成订阅文件
 func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile) error {
-	if subscribeFile.TemplateFilename == "" {
+	templateFilename := subscribeFile.TemplateFilenameForMode(storage.OutputModeNormal)
+	if templateFilename == "" {
 		return errors.New("订阅未绑定模板")
 	}
 
 	// 1. 读取模板文件
-	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
+	templatePath := filepath.Join("rule_templates", templateFilename)
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return fmt.Errorf("读取模板文件失败: %w", err)
 	}
-	logger.Info("[模板生成] 读取模板文件", "template", subscribeFile.TemplateFilename, "bytes", len(templateContent))
+	logger.Info("[模板生成] 读取模板文件", "template", templateFilename, "bytes", len(templateContent))
 
 	// 2. 从节点表获取用户的所有代理节点
 	nodes, err := h.repo.ListNodes(ctx, username)
@@ -1586,7 +1626,7 @@ func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, user
 		return fmt.Errorf("写入订阅文件失败: %w", err)
 	}
 
-	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "result_bytes", len(result))
+	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", templateFilename, "result_bytes", len(result))
 	return nil
 }
 
@@ -1615,9 +1655,9 @@ func RefreshAllTemplateSubscriptions(repo *storage.TrafficRepository, username s
 	successCount := 0
 	for _, file := range files {
 		if err := h.regenerateFromTemplate(ctx, username, file); err != nil {
-			logger.Info("[模板刷新] 刷新订阅失败", "subscribe", file.Name, "template", file.TemplateFilename, "error", err)
+			logger.Info("[模板刷新] 刷新订阅失败", "subscribe", file.Name, "template", file.NormalTemplateFilename, "error", err)
 		} else {
-			logger.Info("[模板刷新] 刷新订阅成功", "subscribe", file.Name, "template", file.TemplateFilename)
+			logger.Info("[模板刷新] 刷新订阅成功", "subscribe", file.Name, "template", file.NormalTemplateFilename)
 			successCount++
 		}
 	}

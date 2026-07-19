@@ -290,6 +290,13 @@ func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficR
 // syncSingleExternalSubscription fetches and syncs nodes from a single external subscription
 // Returns: node count, updated subscription info, error
 func syncSingleExternalSubscription(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
+	key := externalSyncFlightKey(username, sub.ID)
+	return doExternalSyncSingleflight(key, func() (int, storage.ExternalSubscription, error) {
+		return syncSingleExternalSubscriptionLocked(ctx, client, repo, subscribeDir, username, sub, settings)
+	})
+}
+
+func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
 	matchRule := settings.MatchRule
 	syncScope := settings.SyncScope
 	keepNodeName := settings.KeepNodeName
@@ -361,17 +368,27 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		return 0, sub, fmt.Errorf("read response body: %w", err)
 	}
 
+	// Reuse this exact upstream payload for provider filtering/tag refresh below.
+	// Without priming the shared cache, each provider config downloads the same
+	// external subscription again during RefreshProxyProviderCache.
+	storeSubscriptionContentCache(sub.URL, body)
+
 	logger.Info("[外部订阅同步] 成功获取订阅内容", "size", len(body))
 
 	var proxies []any
+	var sourceProxiesNode *yaml.Node
 
-	// 首先尝试解析为 YAML (Clash 格式)
-	var yamlContent map[string]any
-	if err := yaml.Unmarshal(body, &yamlContent); err == nil {
-		// YAML 解析成功，提取 proxies
-		if p, ok := yamlContent["proxies"].([]any); ok && len(p) > 0 {
-			proxies = p
-			logger.Info("[外部订阅同步] 解析为 Clash YAML 格式", "name", sub.Name, "count", len(proxies))
+	// Parse Clash YAML once as a reusable node tree. Decoding the proxies node
+	// walks that tree without lexing/parsing the subscription a second time.
+	var sourceRootNode yaml.Node
+	if err := yaml.Unmarshal(body, &sourceRootNode); err == nil {
+		if parsedProxiesNode := findProxiesNode(&sourceRootNode); parsedProxiesNode != nil && parsedProxiesNode.Kind == yaml.SequenceNode {
+			var decodedProxies []any
+			if err := parsedProxiesNode.Decode(&decodedProxies); err == nil && len(decodedProxies) > 0 {
+				proxies = decodedProxies
+				sourceProxiesNode = parsedProxiesNode
+				logger.Info("[外部订阅同步] 解析为 Clash YAML 格式", "name", sub.Name, "count", len(proxies))
+			}
 		}
 	}
 
@@ -509,168 +526,125 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		existingNodes = remainingNodes
 	}
 
-	// Sync nodes to database (replace nodes based on match rule)
+	// Sync nodes to database. Matching is scoped to the same source URL only
+	// (username already filtered by ListNodes) to prevent cross-source rewrite.
 	syncedCount := 0
 	updatedCount := 0
 	createdCount := 0
 	skippedCount := 0
+	unchangedCount := 0
+	var pendingUpdates []storage.Node
+	var yamlUpdates []NodeUpdate
+	var pendingCreates []storage.Node
+
+	matchIndex := buildSourceNodeMatchIndex(existingNodes, sub.URL)
 
 	for _, node := range nodesToUpdate {
-		var existingNode *storage.Node
-
-		// Parse new node's clash config for matching
 		var newNodeClashConfig map[string]any
 		if err := json.Unmarshal([]byte(node.ClashConfig), &newNodeClashConfig); err != nil {
 			continue
 		}
 
-		newServer, _ := newNodeClashConfig["server"].(string)
-		newPort := newNodeClashConfig["port"]
-		newType, _ := newNodeClashConfig["type"].(string)
-
-		// Match based on rule
-		switch matchRule {
-		case "type_server_port":
-			// Match by type:server:port
-			matchKey := fmt.Sprintf("%s:%s:%v", newType, newServer, newPort)
-			if newServer != "" && newPort != nil && newType != "" {
-				for i := range existingNodes {
-					var existingClashConfig map[string]any
-					if err := json.Unmarshal([]byte(existingNodes[i].ClashConfig), &existingClashConfig); err == nil {
-						// 使用解析IP前的域名匹配
-						existingServer, _ := existingClashConfig["server"].(string)
-						if existingNodes[i].OriginalServer != "" {
-							existingServer = existingNodes[i].OriginalServer
-						}
-						existingPort := existingClashConfig["port"]
-						existingType, _ := existingClashConfig["type"].(string)
-
-						// Compare type:server:port
-						if existingType == newType && existingServer == newServer && fmt.Sprintf("%v", existingPort) == fmt.Sprintf("%v", newPort) {
-							existingNode = &existingNodes[i]
-							logger.Info("[外部订阅同步] 节点 按 type:server:port 匹配成功 -> 已有节点", "node_name", node.NodeName, "param", matchKey, "node_name", existingNode.NodeName)
-							break
-						}
-					}
-				}
-				if existingNode == nil {
-					logger.Info("[外部订阅同步] 节点 按 type:server:port 未找到匹配", "node_name", node.NodeName, "param", matchKey)
-				}
-			}
-		case "server_port":
-			// Match by server:port
-			matchKey := fmt.Sprintf("%s:%v", newServer, newPort)
-			if newServer != "" && newPort != nil {
-				for i := range existingNodes {
-					var existingClashConfig map[string]any
-					if err := json.Unmarshal([]byte(existingNodes[i].ClashConfig), &existingClashConfig); err == nil {
-						// 优先使用原始域名匹配（IP 解析前的地址）
-						existingServer, _ := existingClashConfig["server"].(string)
-						if existingNodes[i].OriginalServer != "" {
-							existingServer = existingNodes[i].OriginalServer
-						}
-						existingPort := existingClashConfig["port"]
-
-						// Compare server:port
-						if existingServer == newServer && fmt.Sprintf("%v", existingPort) == fmt.Sprintf("%v", newPort) {
-							existingNode = &existingNodes[i]
-							logger.Info("[外部订阅同步] 节点 按 server:port 匹配成功 -> 已有节点", "node_name", node.NodeName, "param", matchKey, "node_name", existingNode.NodeName)
-							break
-						}
-					}
-				}
-				if existingNode == nil {
-					logger.Info("[外部订阅同步] 节点 按 server:port 未找到匹配", "node_name", node.NodeName, "param", matchKey)
-				}
-			}
-		default:
-			// Default: match by node name
-			for i := range existingNodes {
-				if existingNodes[i].NodeName == node.NodeName {
-					existingNode = &existingNodes[i]
-					logger.Info("[外部订阅同步] 节点 按名称匹配成功", "node_name", node.NodeName)
-					break
-				}
-			}
-			if existingNode == nil {
-				logger.Info("[外部订阅同步] 节点 按名称未找到匹配", "node_name", node.NodeName)
-			}
-		}
-
-		if existingNode != nil {
-			// Update existing node
+		matchIdx := matchIndex.find(matchRule, node.NodeName, newNodeClashConfig)
+		if matchIdx >= 0 {
+			existingNode := existingNodes[matchIdx]
 			oldNodeName := existingNode.NodeName
 
-			// Update node fields from external subscription
-			existingNode.RawURL = node.RawURL
-			existingNode.Protocol = node.Protocol
-			existingNode.ParsedConfig = node.ParsedConfig
-			existingNode.ClashConfig = node.ClashConfig
-			existingNode.Enabled = node.Enabled
-			existingNode.Tag = node.Tag
+			// Build candidate update without mutating index source until we know it changes.
+			candidate := existingNode
+			candidate.RawURL = node.RawURL
+			candidate.Protocol = node.Protocol
+			candidate.ParsedConfig = node.ParsedConfig
+			candidate.ClashConfig = node.ClashConfig
+			candidate.Enabled = node.Enabled
+			// Preserve multi-tags; only refresh primary Tag from subscription name when empty.
+			if candidate.Tag == "" {
+				candidate.Tag = node.Tag
+			}
 
-			// Handle node name based on keepNodeName setting
 			if !keepNodeName {
-				existingNode.NodeName = node.NodeName // Update to new name from external subscription
-				if oldNodeName != node.NodeName {
-					logger.Info("[外部订阅同步] 更新节点名称 ->", "value", oldNodeName, "node_name", node.NodeName)
-				}
+				candidate.NodeName = node.NodeName
 			} else {
-				logger.Info("[外部订阅同步] 保留原节点名称 (外部订阅名称)", "value", oldNodeName, "node_name", node.NodeName)
-				// 更新 ClashConfig 和 ParsedConfig 中的 name 字段为保留的节点名称
+				// Force clash/parsed name to retained node name
 				var clashConfig map[string]any
-				if err := json.Unmarshal([]byte(existingNode.ClashConfig), &clashConfig); err == nil {
+				if err := json.Unmarshal([]byte(candidate.ClashConfig), &clashConfig); err == nil {
 					clashConfig["name"] = oldNodeName
 					if updatedClash, err := json.Marshal(clashConfig); err == nil {
-						existingNode.ClashConfig = string(updatedClash)
+						candidate.ClashConfig = string(updatedClash)
 					}
 				}
 				var parsedConfig map[string]any
-				if err := json.Unmarshal([]byte(existingNode.ParsedConfig), &parsedConfig); err == nil {
+				if err := json.Unmarshal([]byte(candidate.ParsedConfig), &parsedConfig); err == nil {
 					parsedConfig["name"] = oldNodeName
 					if updatedParsed, err := json.Marshal(parsedConfig); err == nil {
-						existingNode.ParsedConfig = string(updatedParsed)
+						candidate.ParsedConfig = string(updatedParsed)
 					}
 				}
+				candidate.NodeName = oldNodeName
 			}
 
-			_, err := repo.UpdateNode(ctx, *existingNode)
-			if err != nil {
-				logger.Info("[外部订阅同步] 更新节点 失败", "node_name", existingNode.NodeName, "error", err)
+			if nodeSyncPayloadEqual(existingNode, candidate, keepNodeName) {
+				unchangedCount++
+				syncedCount++
 				continue
 			}
 
-			logger.Info("[外部订阅同步] 成功更新节点 (ID)", "node_name", existingNode.NodeName, "id", existingNode.ID)
-
-			// Sync to YAML files (handle name change if needed)
+			pendingUpdates = append(pendingUpdates, candidate)
 			if subscribeDir != "" {
-				if err := syncNodeToYAMLFiles(subscribeDir, oldNodeName, existingNode.NodeName, existingNode.ClashConfig); err != nil {
-					logger.Info("[外部订阅同步] 同步节点 到YAML文件失败", "node_name", existingNode.NodeName, "error", err)
-				}
+				yamlUpdates = append(yamlUpdates, NodeUpdate{
+					OldName:         oldNodeName,
+					NewName:         candidate.NodeName,
+					ClashConfigJSON: candidate.ClashConfig,
+				})
 			}
-
+			// Refresh index entry name if renamed within this source
+			if oldNodeName != candidate.NodeName {
+				delete(matchIndex.byName, oldNodeName)
+				matchIndex.byName[candidate.NodeName] = matchIdx
+			}
+			existingNodes[matchIdx] = candidate
 			syncedCount++
 			updatedCount++
 		} else {
-			// New node not found in existing nodes
-			// Check sync scope: only create new nodes if syncScope is "all"
 			if syncScope == "all" {
-				_, err := repo.CreateNode(ctx, node)
-				if err != nil {
-					logger.Info("[外部订阅同步] 创建新节点 失败", "node_name", node.NodeName, "error", err)
-					continue
-				}
-				logger.Info("[外部订阅同步] 成功创建新节点", "node_name", node.NodeName)
+				pendingCreates = append(pendingCreates, node)
 				syncedCount++
 				createdCount++
 			} else {
-				logger.Info("[外部订阅同步] 跳过新节点 (同步范围: 仅已保存节点)", "node_name", node.NodeName)
 				skippedCount++
 			}
 		}
 	}
 
-	logger.Info("[外部订阅同步] 订阅同步完成", "name", sub.Name, "synced_count", syncedCount, "total_count", len(nodesToUpdate), "updated", updatedCount, "created", createdCount, "skipped", skippedCount)
+	if len(pendingUpdates) > 0 {
+		if err := repo.BatchUpdateNodesNoFetch(ctx, pendingUpdates); err != nil {
+			logger.Info("[外部订阅同步] 批量更新节点失败", "error", err, "count", len(pendingUpdates))
+			return 0, sub, fmt.Errorf("batch update nodes: %w", err)
+		}
+	}
+	if len(pendingCreates) > 0 {
+		if err := repo.BatchCreateNodesNoFetch(ctx, pendingCreates); err != nil {
+			logger.Info("[外部订阅同步] 批量创建节点失败", "error", err, "count", len(pendingCreates))
+			return 0, sub, fmt.Errorf("batch create nodes: %w", err)
+		}
+	}
+	// YAML: one read/parse/write pass per file for the whole batch
+	if subscribeDir != "" && len(yamlUpdates) > 0 {
+		if err := batchSyncNodesToYAMLFiles(subscribeDir, yamlUpdates); err != nil {
+			logger.Info("[外部订阅同步] 批量同步YAML失败", "error", err)
+		}
+	}
+
+	logger.Info("[外部订阅同步] 订阅同步完成",
+		"name", sub.Name,
+		"synced_count", syncedCount,
+		"total_count", len(nodesToUpdate),
+		"updated", updatedCount,
+		"unchanged", unchangedCount,
+		"created", createdCount,
+		"skipped", skippedCount,
+		"yaml_updates", len(yamlUpdates),
+	)
 
 	// 将每个 Provider 的最终过滤结果映射为节点池系统标签，供普通链接按标签选择。
 	providerConfigs, providerErr := repo.ListProxyProviderConfigsBySubscription(ctx, sub.ID)
@@ -678,7 +652,21 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		logger.Warn("[代理集合标签] 获取 Provider 配置失败", "subscription", sub.Name, "error", providerErr)
 	} else {
 		for _, config := range providerConfigs {
-			if err := refreshAndSyncProviderNodeTags(ctx, repo, sub, config); err != nil {
+			// Do not serve an older derived provider entry if rebuilding from the
+			// newly fetched payload fails. A successful refresh stores the new one.
+			GetProxyProviderCache().Delete(config.ID)
+			var entry *CacheEntry
+			var refreshErr error
+			if sourceProxiesNode != nil {
+				entry, refreshErr = refreshProxyProviderCacheFromNode(&sub, &config, sourceProxiesNode)
+			} else {
+				entry, refreshErr = RefreshProxyProviderCache(&sub, &config)
+			}
+			if refreshErr != nil {
+				logger.Warn("[代理集合标签] 外部订阅同步后刷新标签失败", "provider", config.Name, "error", refreshErr)
+				continue
+			}
+			if err := syncProviderNodeTags(ctx, repo, sub, config, entry); err != nil {
 				logger.Warn("[代理集合标签] 外部订阅同步后刷新标签失败", "provider", config.Name, "error", err)
 			}
 		}

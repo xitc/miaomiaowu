@@ -74,21 +74,37 @@ func ValidateSubscribeOutputModes(file SubscribeFile, providerClientCount int) e
 		return fmt.Errorf("默认输出模式为 Provider 链接，但未启用 Provider 链接")
 	}
 	if file.ProviderLinkEnabled {
-		if strings.TrimSpace(file.TemplateFilename) == "" {
+		if strings.TrimSpace(file.ProviderTemplateFilename) == "" {
 			return fmt.Errorf("启用 Provider 链接时必须绑定 v3 模板")
 		}
 		if providerClientCount <= 0 {
 			return fmt.Errorf("启用 Provider 链接时需要至少一个可用的 client provider")
 		}
 	}
+	if file.NormalLinkEnabled && file.ProviderLinkEnabled {
+		if strings.TrimSpace(file.NormalTemplateFilename) == "" {
+			return fmt.Errorf("同时启用普通链接和 Provider 链接时必须绑定普通链接模板")
+		}
+		if strings.TrimSpace(file.NormalTemplateFilename) == strings.TrimSpace(file.ProviderTemplateFilename) {
+			return fmt.Errorf("普通链接和 Provider 链接必须使用不同模板")
+		}
+	}
 	// True raw file output is mutually exclusive with provider mode generation.
 	if file.RawOutput && file.ProviderLinkEnabled {
 		return fmt.Errorf("原始文件输出与 Provider 链接不能同时启用")
 	}
-	if file.RawOutput && strings.TrimSpace(file.TemplateFilename) != "" {
+	if file.RawOutput && (strings.TrimSpace(file.NormalTemplateFilename) != "" || strings.TrimSpace(file.ProviderTemplateFilename) != "") {
 		return fmt.Errorf("原始文件输出不能绑定模板")
 	}
 	return nil
+}
+
+// TemplateFilenameForMode returns the template bound to one output mode.
+func (f SubscribeFile) TemplateFilenameForMode(mode string) string {
+	if NormalizeDefaultOutputMode(mode) == OutputModeProvider {
+		return strings.TrimSpace(f.ProviderTemplateFilename)
+	}
+	return strings.TrimSpace(f.NormalTemplateFilename)
 }
 
 // ResolveOutputMode picks the effective generation mode for a subscription request.

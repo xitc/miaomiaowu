@@ -51,6 +51,19 @@ func TestReconcileProviderNodeTagsRemovesRenamedTag(t *testing.T) {
 	}
 }
 
+func TestReconcileProviderNodeTagsIsIdempotent(t *testing.T) {
+	tag := "Provider/HK"
+	nodes := []storage.Node{{
+		ID: 1, RawURL: "u", NodeName: "n", ClashConfig: `{"name":"n","type":"ss","server":"s","port":1}`,
+		Tag: "source", Tags: []string{"source", tag},
+	}}
+	providerNodes := []any{map[string]any{"name": "n", "type": "ss", "server": "s", "port": 1}}
+
+	if changed := reconcileProviderNodeTags(nodes, "u", tag, nil, providerNodes); len(changed) != 0 {
+		t.Fatalf("already-correct provider tags changed: %+v", changed)
+	}
+}
+
 func TestProviderNodeTagUsesNamespace(t *testing.T) {
 	got := providerNodeTag(storage.ProxyProviderConfig{Name: " 香港 "})
 	if got != "Provider/香港" {
@@ -75,5 +88,22 @@ func TestMissingProviderNodesLoadsIntoPool(t *testing.T) {
 	}
 	if missing[0].NodeName != "new" || missing[0].Protocol != "trojan" || !hasTag(missing[0].Tags, "Provider/HK") || !hasTag(missing[0].Tags, "source") {
 		t.Fatalf("unexpected imported node: %+v", missing[0])
+	}
+}
+
+func TestMissingProviderNodesKeepsOverlappingNamesSourceLocal(t *testing.T) {
+	sub := storage.ExternalSubscription{Username: "admin", Name: "source-b", URL: "source-b-url"}
+	existing := []storage.Node{{
+		ID: 1, Username: "admin", RawURL: "source-a-url", NodeName: "shared",
+		ClashConfig: `{"name":"shared","type":"ss","server":"a","port":1}`,
+	}}
+	providerNodes := []any{map[string]any{"name": "shared", "type": "trojan", "server": "b", "port": 443}}
+
+	missing := missingProviderNodes(existing, sub, "Provider/B", providerNodes)
+	if len(missing) != 1 {
+		t.Fatalf("source-b node with overlapping name was suppressed: %+v", missing)
+	}
+	if missing[0].RawURL != sub.URL || !hasTag(missing[0].Tags, "Provider/B") {
+		t.Fatalf("missing node lost source identity: %+v", missing[0])
 	}
 }

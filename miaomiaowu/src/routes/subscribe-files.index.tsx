@@ -59,6 +59,8 @@ type SubscribeFile = {
   selected_custom_rule_ids: number[]
   selected_override_script_ids: number[]
   template_filename: string
+  normal_template_filename?: string
+  provider_template_filename?: string
   selected_tags: string[]
   selected_node_ids?: number[]
   selected_provider_names?: string[]
@@ -367,6 +369,8 @@ function SubscribeFilesPage() {
     description: '',
     filename: '',
     template_filename: '',
+    normal_template_filename: '',
+    provider_template_filename: '',
     selected_tags: [] as string[],
     selected_node_ids: [] as number[],
     selected_provider_names: [] as string[],
@@ -554,7 +558,7 @@ function SubscribeFilesPage() {
   const probeServers = probeConfigData?.config?.servers ?? []
 
   // 绑定v3模板
-  const hasTemplateBindings = files.some(f => f.template_filename)
+  const hasTemplateBindings = files.some(f => f.normal_template_filename || f.provider_template_filename || f.template_filename)
 
   // 获取所有节点（用于在外部订阅卡片中显示节点名称, v3模板订阅标签）
   const { data: allNodesData } = useQuery({
@@ -730,7 +734,7 @@ function SubscribeFilesPage() {
       toast.success('订阅信息已更新')
       setEditMetadataDialogOpen(false)
       setEditingMetadata(null)
-      setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
+      setMetadataForm({ name: '', description: '', filename: '', template_filename: '', normal_template_filename: '', provider_template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.error || '更新失败')
@@ -1629,11 +1633,13 @@ function SubscribeFilesPage() {
       description: file.description,
       filename: file.filename,
       template_filename: file.template_filename || '',
+      normal_template_filename: file.normal_template_filename || (normalEnabled ? file.template_filename : '') || '',
+      provider_template_filename: file.provider_template_filename || (providerEnabled ? file.template_filename : '') || '',
       selected_tags: tags,
       selected_node_ids: nodeIDs,
       selected_provider_names: file.selected_provider_names || [],
       // raw_output is true raw file only (no template); never the old provider flag
-      raw_output: !!file.raw_output && !file.template_filename,
+      raw_output: !!file.raw_output && !(file.normal_template_filename || file.provider_template_filename || file.template_filename),
       normal_link_enabled: normalEnabled,
       provider_link_enabled: providerEnabled,
       default_output_mode: (file.default_output_mode === 'provider' ? 'provider' : 'normal'),
@@ -1660,8 +1666,16 @@ function SubscribeFilesPage() {
       toast.error('至少启用一种输出模式（普通链接或 Provider 链接）')
       return
     }
-    if (metadataForm.provider_link_enabled && !metadataForm.template_filename) {
+    if (metadataForm.provider_link_enabled && !metadataForm.provider_template_filename) {
       toast.error('启用 Provider 链接时必须绑定 v3 模板')
+      return
+    }
+    if (metadataForm.normal_link_enabled && metadataForm.provider_link_enabled && !metadataForm.normal_template_filename) {
+      toast.error('同时启用两种链接时必须绑定普通链接模板')
+      return
+    }
+    if (metadataForm.normal_link_enabled && metadataForm.provider_link_enabled && metadataForm.normal_template_filename === metadataForm.provider_template_filename) {
+      toast.error('普通链接和 Provider 链接必须使用不同模板')
       return
     }
     if (metadataForm.provider_link_enabled && clientProxyProviderConfigs.length === 0) {
@@ -1681,12 +1695,14 @@ function SubscribeFilesPage() {
         name: metadataForm.name,
         description: metadataForm.description,
         filename: metadataForm.filename,
-        template_filename: metadataForm.template_filename || null,
+        template_filename: metadataForm.normal_template_filename || metadataForm.provider_template_filename || null,
+        normal_template_filename: metadataForm.normal_template_filename || null,
+        provider_template_filename: metadataForm.provider_template_filename || null,
         // 普通/Provider 配置独立保存，切换模式不清空另一套
         selected_tags: pickerMode === 'node' ? [] : metadataForm.selected_tags,
         selected_node_ids: pickerMode === 'node' ? metadataForm.selected_node_ids : [],
         selected_provider_names: metadataForm.selected_provider_names,
-        raw_output: metadataForm.raw_output && !metadataForm.template_filename,
+        raw_output: metadataForm.raw_output && !metadataForm.normal_template_filename && !metadataForm.provider_template_filename,
         normal_link_enabled: metadataForm.normal_link_enabled,
         provider_link_enabled: metadataForm.provider_link_enabled,
         default_output_mode: defaultMode,
@@ -3250,11 +3266,12 @@ function SubscribeFilesPage() {
                     cellClassName: 'text-center',
                     width: '120px'
                   },
-                  // V3 模板绑定列（仅 v3 模式显示）
+                  // 普通链接 V3 模板绑定列（仅 v3 模式显示）
                   ...(isV3Mode ? [{
-                    header: 'V3 模板',
+                    header: '普通模板',
                     cell: (file: SubscribeFile) => {
-                      const selectedTemplate = v3Templates.find(t => t.filename === file.template_filename)
+                      const normalTemplateFilename = file.normal_template_filename || ((file.normal_link_enabled ?? true) ? file.template_filename : '')
+                      const selectedTemplate = v3Templates.find(t => t.filename === normalTemplateFilename)
                       return (
                         <Popover>
                           <PopoverTrigger asChild>
@@ -3277,7 +3294,7 @@ function SubscribeFilesPage() {
                                 size="sm"
                                 className={cn(
                                   "justify-start text-xs h-8",
-                                  !file.template_filename && "bg-accent"
+                                  !normalTemplateFilename && "bg-accent"
                                 )}
                                 onClick={() => {
                                   updateMetadataMutation.mutate({
@@ -3286,7 +3303,8 @@ function SubscribeFilesPage() {
                                       name: file.name,
                                       description: file.description,
                                       auto_sync_custom_rules: file.auto_sync_custom_rules,
-                                      template_filename: '',
+                                      template_filename: file.provider_template_filename || '',
+                                      normal_template_filename: '',
                                     }
                                   }, {
                                     onSuccess: () => {
@@ -3295,8 +3313,8 @@ function SubscribeFilesPage() {
                                   })
                                 }}
                               >
-                                {!file.template_filename && <Check className="h-3 w-3 mr-2" />}
-                                <span className={!file.template_filename ? '' : 'ml-5'}>无</span>
+                                {!normalTemplateFilename && <Check className="h-3 w-3 mr-2" />}
+                                <span className={!normalTemplateFilename ? '' : 'ml-5'}>无</span>
                               </Button>
                               {v3Templates.map((template) => (
                                 <Button
@@ -3305,7 +3323,7 @@ function SubscribeFilesPage() {
                                   size="sm"
                                   className={cn(
                                     "justify-start text-xs h-8",
-                                    file.template_filename === template.filename && "bg-accent"
+                                    normalTemplateFilename === template.filename && "bg-accent"
                                   )}
                                   onClick={() => {
                                     updateMetadataMutation.mutate({
@@ -3315,6 +3333,7 @@ function SubscribeFilesPage() {
                                         description: file.description,
                                         auto_sync_custom_rules: file.auto_sync_custom_rules,
                                         template_filename: template.filename,
+                                        normal_template_filename: template.filename,
                                       }
                                     }, {
                                       onSuccess: () => {
@@ -3323,8 +3342,8 @@ function SubscribeFilesPage() {
                                     })
                                   }}
                                 >
-                                  {file.template_filename === template.filename && <Check className="h-3 w-3 mr-2" />}
-                                  <span className={file.template_filename === template.filename ? '' : 'ml-5'}>{template.name}</span>
+                                  {normalTemplateFilename === template.filename && <Check className="h-3 w-3 mr-2" />}
+                                  <span className={normalTemplateFilename === template.filename ? '' : 'ml-5'}>{template.name}</span>
                                 </Button>
                               ))}
                             </div>
@@ -3340,7 +3359,8 @@ function SubscribeFilesPage() {
                   {
                     header: '节点标签',
                     cell: (file: SubscribeFile) => {
-                      if (!file.template_filename) {
+                      const normalTemplateFilename = file.normal_template_filename || ((file.normal_link_enabled ?? true) ? file.template_filename : '')
+                      if (!normalTemplateFilename) {
                         return <span className="text-muted-foreground text-xs">-</span>
                       }
                       const selectedTags = file.selected_tags || []
@@ -3375,7 +3395,8 @@ function SubscribeFilesPage() {
                                       name: file.name,
                                       description: file.description,
                                       auto_sync_custom_rules: file.auto_sync_custom_rules,
-                                      template_filename: file.template_filename,
+                                      template_filename: normalTemplateFilename,
+                                      normal_template_filename: normalTemplateFilename,
                                       selected_tags: [],
                                     }
                                   }, {
@@ -3409,7 +3430,8 @@ function SubscribeFilesPage() {
                                           name: file.name,
                                           description: file.description,
                                           auto_sync_custom_rules: file.auto_sync_custom_rules,
-                                          template_filename: file.template_filename,
+                                          template_filename: normalTemplateFilename,
+                                          normal_template_filename: normalTemplateFilename,
                                           selected_tags: newTags,
                                         }
                                       }, {
@@ -5217,7 +5239,7 @@ function SubscribeFilesPage() {
         setEditMetadataDialogOpen(open)
         if (!open) {
           setEditingMetadata(null)
-          setMetadataForm({ name: '', description: '', filename: '', template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
+          setMetadataForm({ name: '', description: '', filename: '', template_filename: '', normal_template_filename: '', provider_template_filename: '', selected_tags: [], selected_node_ids: [], selected_provider_names: [], raw_output: false, normal_link_enabled: true, provider_link_enabled: false, default_output_mode: 'normal', expire: undefined, traffic_limit: '', stats_server_ids: '' })
         }
       }}>
         <DialogContent className='sm:max-w-lg max-h-[90vh] flex flex-col'>
@@ -5287,65 +5309,63 @@ function SubscribeFilesPage() {
                 设置订阅链接的过期时间，过期后链接将失效
               </p>
             </div>
-            <div className='space-y-2'>
-              <Label>绑定 V3 模板（可选）</Label>
-              <Popover>
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    className="w-full justify-between"
-                  >
-                    <span className="truncate">
-                      {metadataForm.template_filename
-                        ? v3Templates.find(t => t.filename === metadataForm.template_filename)?.name || metadataForm.template_filename
-                        : '不绑定模板'}
-                    </span>
-                    <ChevronDown className="h-4 w-4 shrink-0 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent className="w-[--radix-popover-trigger-width] p-1" align="start">
-                  <div className="flex flex-col max-h-[300px] overflow-y-auto">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className={cn(
-                        "justify-start h-9",
-                        !metadataForm.template_filename && "bg-accent"
-                      )}
-                      onClick={() => {
-                        if (metadataForm.provider_link_enabled) {
-                          toast.error('请先关闭 Provider 链接，再取消绑定模板')
-                          return
-                        }
-                        setMetadataForm({ ...metadataForm, template_filename: '' })
-                      }}
-                    >
-                      {!metadataForm.template_filename && <Check className="h-4 w-4 mr-2" />}
-                      <span className={!metadataForm.template_filename ? '' : 'ml-6'}>不绑定模板</span>
-                    </Button>
-                    {v3Templates.map((template) => (
-                      <Button
-                        key={template.filename}
-                        variant="ghost"
-                        size="sm"
-                        className={cn(
-                          "justify-start h-9",
-                          metadataForm.template_filename === template.filename && "bg-accent"
-                        )}
-                        onClick={() => setMetadataForm({ ...metadataForm, template_filename: template.filename })}
-                      >
-                        {metadataForm.template_filename === template.filename && <Check className="h-4 w-4 mr-2" />}
-                        <span className={metadataForm.template_filename === template.filename ? '' : 'ml-6'}>{template.name}</span>
+            {(['normal', 'provider'] as const).map((mode) => {
+              const field = mode === 'normal' ? 'normal_template_filename' : 'provider_template_filename'
+              const enabled = mode === 'normal' ? metadataForm.normal_link_enabled : metadataForm.provider_link_enabled
+              const value = metadataForm[field]
+              return enabled ? (
+                <div key={mode} className='space-y-2'>
+                  <Label>
+                    {mode === 'normal' ? '普通链接模板' : 'Provider 链接模板'}
+                    {(mode === 'provider' || metadataForm.provider_link_enabled) ? ' *' : '（可选）'}
+                  </Label>
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <Button variant='outline' className='w-full justify-between'>
+                        <span className='truncate'>
+                          {value ? v3Templates.find(t => t.filename === value)?.name || value : '选择模板'}
+                        </span>
+                        <ChevronDown className='h-4 w-4 shrink-0 opacity-50' />
                       </Button>
-                    ))}
-                  </div>
-                </PopoverContent>
-              </Popover>
-              <p className='text-xs text-muted-foreground'>
-                绑定模板后，获取订阅时将根据模板动态生成配置。绑定模板会自动禁用覆写开关。
-              </p>
-            </div>
-            {metadataForm.template_filename && (
+                    </PopoverTrigger>
+                    <PopoverContent className='w-[--radix-popover-trigger-width] p-1' align='start'>
+                      <div className='flex flex-col max-h-[300px] overflow-y-auto'>
+                        <Button
+                          variant='ghost'
+                          size='sm'
+                          className={cn('justify-start h-9', !value && 'bg-accent')}
+                          onClick={() => setMetadataForm({ ...metadataForm, [field]: '' })}
+                        >
+                          {!value && <Check className='h-4 w-4 mr-2' />}
+                          <span className={!value ? '' : 'ml-6'}>不绑定模板</span>
+                        </Button>
+                        {v3Templates.map((template) => (
+                          <Button
+                            key={template.filename}
+                            variant='ghost'
+                            size='sm'
+                            className={cn('justify-start h-9', value === template.filename && 'bg-accent')}
+                            onClick={() => setMetadataForm({ ...metadataForm, [field]: template.filename })}
+                          >
+                            {value === template.filename && <Check className='h-4 w-4 mr-2' />}
+                            <span className={value === template.filename ? '' : 'ml-6'}>{template.name}</span>
+                          </Button>
+                        ))}
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                  <p className='text-xs text-muted-foreground'>
+                    {mode === 'normal' ? '用于生成完整 proxies 配置。' : '用于生成 Mihomo proxy-providers 与 use 配置。'}
+                  </p>
+                </div>
+              ) : null
+            })}
+            {metadataForm.normal_link_enabled && metadataForm.provider_link_enabled && metadataForm.normal_template_filename && metadataForm.normal_template_filename === metadataForm.provider_template_filename && (
+              <div className='rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive'>
+                两种输出结构不同，普通链接和 Provider 链接不能共用同一个模板。
+              </div>
+            )}
+            {(
               <div className='space-y-3 rounded-lg border p-3'>
                 <div className='space-y-0.5'>
                   <Label>输出模式</Label>
@@ -5423,7 +5443,7 @@ function SubscribeFilesPage() {
                 )}
               </div>
             )}
-            {metadataForm.template_filename && metadataForm.provider_link_enabled && (
+            {metadataForm.provider_template_filename && metadataForm.provider_link_enabled && (
               <div className='space-y-2 rounded-lg border p-3'>
                 <div className='flex items-center justify-between gap-2'>
                   <div className='space-y-0.5'>
@@ -5490,7 +5510,7 @@ function SubscribeFilesPage() {
               </div>
             )}
             {/* 节点选择：普通链接启用时显示，与 Provider 选择并存 */}
-            {metadataForm.template_filename && metadataForm.normal_link_enabled && (
+            {metadataForm.normal_template_filename && metadataForm.normal_link_enabled && (
               <div className='space-y-2'>
                 <div className='flex items-center justify-between gap-2'>
                   <Label>节点筛选</Label>
