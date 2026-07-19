@@ -97,6 +97,13 @@ type SubscriptionHandler struct {
 	fallback string
 }
 
+func refreshSubscriptionDataAfterExternalSync(fromTemplate bool, generateTemplate, readFile func() ([]byte, error)) ([]byte, error) {
+	if fromTemplate {
+		return generateTemplate()
+	}
+	return readFile()
+}
+
 type subscriptionEndpoint struct {
 	tokens *auth.TokenStore
 	repo   *storage.TrafficRepository
@@ -508,13 +515,24 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 						} else {
 							logger.Info("[Subscription] External subscriptions sync completed successfully")
 
-							// Re-read the subscription file after sync to get updated nodes
-							updatedData, err := os.ReadFile(resolvedPath)
+							// Preserve the requested output mode after sync. Template-backed
+							// responses must be regenerated from the same mode-specific
+							// template; reading resolvedPath here would replace Provider output
+							// with the normal on-disk subscription YAML.
+							updatedData, err := refreshSubscriptionDataAfterExternalSync(
+								fromTemplate,
+								func() ([]byte, error) {
+									return h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode)
+								},
+								func() ([]byte, error) {
+									return os.ReadFile(resolvedPath)
+								},
+							)
 							if err != nil {
-								logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
+								logger.Info("[Subscription] 同步后刷新订阅输出失败", "mode", outputMode, "from_template", fromTemplate, "error", err)
 							} else {
 								data = updatedData
-								logger.Info("[Subscription] 同步后重新读取订阅文件成功", "bytes", len(data))
+								logger.Info("[Subscription] 同步后刷新订阅输出成功", "mode", outputMode, "from_template", fromTemplate, "bytes", len(data))
 							}
 						}
 					}
