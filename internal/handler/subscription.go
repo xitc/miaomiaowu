@@ -27,6 +27,8 @@ import (
 
 const subscriptionDefaultType = "clash"
 
+const providerSourceOutputMode = "provider-source"
+
 // Token失效时返回的YAML内容
 const tokenInvalidYAML = `allow-lan: false
 dns:
@@ -84,6 +86,21 @@ socks-port: 7891
 `
 
 const tokenInvalidFilename = "token_invalid.yaml"
+
+const expiredProviderYAML = `proxies:
+  - name: ⚠️ 订阅已过期
+    type: ss
+    server: test.example.com.cn
+    port: 443
+    password: J6h6sFZp0Xxv7M8K2RZ6nN8c8ZxQpJZcQ4M2YVtPZ5Q=
+    cipher: 2022-blake3-chacha20-poly1305
+  - name: ⚠️ 请联系管理员
+    type: ss
+    server: test.example.com.cn
+    port: 443
+    password: J6h6sFZp0Xxv7M8K2RZ6nN8c8ZxQpJZcQ4M2YVtPZ5Q=
+    cipher: 2022-blake3-chacha20-poly1305
+`
 
 // Context key for token invalid flag
 type ContextKey string
@@ -328,13 +345,25 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	requestedMode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	isProviderSourceRequest := requestedMode == providerSourceOutputMode
+
 	if hasSubscribeFile && subscribeFile.ExpireAt != nil {
 		now := time.Now()
 		if !subscribeFile.ExpireAt.After(now) {
 			logger.Info("[Subscription] 订阅已过期", "filename", filename, "expire_at", subscribeFile.ExpireAt.Format("2006-01-02 15:04:05"))
+			if isProviderSourceRequest {
+				h.serveExpiredProviderResponse(w)
+				return
+			}
 			h.serveTokenInvalidResponse(w, r)
 			return
 		}
+	}
+
+	if isProviderSourceRequest {
+		h.serveSubscriptionProvider(w, r, username, subscribeFile)
+		return
 	}
 
 	// 解析输出模式：mode=normal|provider；未传时使用 default_output_mode
@@ -394,7 +423,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	if hasSubscribeFile && templateFilename != "" {
 		stepStart = time.Now()
-		templateData, err := h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode)
+		templateData, err := h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode, r)
 		if err != nil {
 			// 不得静默回退到另一种输出模式
 			if outputMode == storage.OutputModeProvider {
@@ -522,7 +551,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							updatedData, err := refreshSubscriptionDataAfterExternalSync(
 								fromTemplate,
 								func() ([]byte, error) {
-									return h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode)
+									return h.generateFromTemplate(r.Context(), username, subscribeFile, outputMode, r)
 								},
 								func() ([]byte, error) {
 									return os.ReadFile(resolvedPath)
@@ -1385,6 +1414,7 @@ func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r
 	attachmentName := url.PathEscape("Token已失效" + ext)
 
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("profile-update-interval", "24")
 	if clientType == "" {
 		w.Header().Set("content-disposition", "attachment;filename*=UTF-8''"+attachmentName)
@@ -2341,9 +2371,137 @@ func matchesSubscribeNodeSelection(node storage.Node, selectedNodeIDs map[int64]
 	return true
 }
 
+func buildSubscriptionProviderGatewayURLs(r *http.Request, providerConfigs []storage.ProxyProviderConfig) map[int64]string {
+	result := make(map[int64]string, len(providerConfigs))
+	if r == nil || strings.TrimSpace(r.Host) == "" {
+		return result
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwardedProto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwardedProto == "http" || forwardedProto == "https" {
+		scheme = forwardedProto
+	}
+
+	base := url.URL{Scheme: scheme, Host: r.Host, Path: r.URL.Path}
+	query := r.URL.Query()
+	query.Del("t")
+	query.Del("mode")
+	query.Del("provider_id")
+	// filename is injected internally by the short-link handler and must not leak
+	// into the public short URL. Direct links require it to resolve the subscription.
+	if r.URL.Path != "/api/clash/subscribe" {
+		query.Del("filename")
+		query.Del("token")
+	}
+	query.Set("mode", providerSourceOutputMode)
+
+	for _, config := range providerConfigs {
+		providerURL := base
+		providerQuery := cloneURLValues(query)
+		providerQuery.Set("provider_id", strconv.FormatInt(config.ID, 10))
+		providerURL.RawQuery = providerQuery.Encode()
+		result[config.ID] = providerURL.String()
+	}
+	return result
+}
+
+func cloneURLValues(values url.Values) url.Values {
+	cloned := make(url.Values, len(values))
+	for key, entries := range values {
+		cloned[key] = append([]string(nil), entries...)
+	}
+	return cloned
+}
+
+func selectedProviderAllows(configName string, selectedProviderNames []string) bool {
+	if len(selectedProviderNames) == 0 {
+		return true
+	}
+	for _, name := range selectedProviderNames {
+		if strings.TrimSpace(name) == configName {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *SubscriptionHandler) providerNodeOwner(ctx context.Context, username string) string {
+	nodeOwner := username
+	if user, err := h.repo.GetUser(ctx, username); err == nil && user.Role != storage.RoleAdmin {
+		if adminName, err := h.repo.GetAdminUsername(ctx); err == nil {
+			nodeOwner = adminName
+		}
+	}
+	return nodeOwner
+}
+
+func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r *http.Request, username string, subscribeFile storage.SubscribeFile) {
+	if !subscribeFile.ProviderLinkEnabled {
+		writeError(w, http.StatusNotFound, errors.New("not found"))
+		return
+	}
+
+	providerID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("provider_id")), 10, 64)
+	if err != nil || providerID <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid provider_id"))
+		return
+	}
+
+	config, err := h.repo.GetProxyProviderConfig(r.Context(), providerID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	nodeOwner := h.providerNodeOwner(r.Context(), username)
+	if config == nil || config.Username != nodeOwner || !selectedProviderAllows(config.Name, subscribeFile.SelectedProviderNames) {
+		writeError(w, http.StatusNotFound, errors.New("not found"))
+		return
+	}
+	if config.ProcessMode != "" && config.ProcessMode != "client" {
+		writeError(w, http.StatusBadRequest, errors.New("provider is not in client mode"))
+		return
+	}
+
+	sub, err := h.repo.GetExternalSubscription(r.Context(), config.ExternalSubscriptionID, nodeOwner)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if sub.ID == 0 {
+		writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+		return
+	}
+
+	data, err := fetchSubscriptionContent(&sub)
+	if err != nil {
+		logger.Info("[SubscriptionProvider] 拉取上游 Provider 失败", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "error", err)
+		writeError(w, http.StatusBadGateway, errors.New("provider upstream unavailable"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.RecordSuccess(GetClientIP(r))
+	}
+	logger.Info("[SubscriptionProvider] Provider 访问成功", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "bytes", len(data))
+}
+
+func (h *SubscriptionHandler) serveExpiredProviderResponse(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(expiredProviderYAML))
+}
+
 // generateFromTemplate 基于绑定的 V3 模板生成订阅配置。
 // outputMode 为 normal（节点/标签）或 provider（proxy-providers / use）。
-func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile, outputMode string) ([]byte, error) {
+func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile, outputMode string, request *http.Request) ([]byte, error) {
 	outputMode = storage.NormalizeDefaultOutputMode(outputMode)
 	templateFilename := subscribeFile.TemplateFilenameForMode(outputMode)
 	if templateFilename == "" {
@@ -2503,7 +2661,8 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		if len(providerConfigs) == 0 {
 			return nil, errors.New("没有可用且来源地址有效的 client provider（可能已失效或未选择）")
 		}
-		result, err := processProviderOnlyV3Template(string(templateContent), providerConfigs, providerURLs)
+		gatewayURLs := buildSubscriptionProviderGatewayURLs(request, providerConfigs)
+		result, err := processProviderOnlyV3Template(string(templateContent), providerConfigs, providerURLs, gatewayURLs)
 		if err != nil {
 			return nil, fmt.Errorf("处理 Provider 模板失败: %w", err)
 		}
@@ -2630,7 +2789,7 @@ func filterUsableClientProxyProviders(providerConfigs []storage.ProxyProviderCon
 	return filtered
 }
 
-func processProviderOnlyV3Template(templateContent string, providerConfigs []storage.ProxyProviderConfig, providerURLs map[int64]string) (string, error) {
+func processProviderOnlyV3Template(templateContent string, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string) (string, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
 		return "", err
@@ -2653,7 +2812,7 @@ func processProviderOnlyV3Template(templateContent string, providerConfigs []sto
 	}
 
 	rootMap := root.Content[0]
-	injectClientProxyProviders(rootMap, clientConfigs, providerURLs)
+	injectClientProxyProviders(rootMap, clientConfigs, providerURLs, gatewayURLs)
 	rewriteProxyGroupsForProviderMode(rootMap, providerNames)
 
 	var buf strings.Builder
@@ -2668,7 +2827,7 @@ func processProviderOnlyV3Template(templateContent string, providerConfigs []sto
 	return buf.String(), nil
 }
 
-func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.ProxyProviderConfig, providerURLs map[int64]string) {
+func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string) {
 	var proxyProvidersNode *yaml.Node
 	for i := 0; i < len(rootMap.Content)-1; i += 2 {
 		if rootMap.Content[i].Value == "proxy-providers" && rootMap.Content[i+1].Kind == yaml.MappingNode {
@@ -2686,6 +2845,9 @@ func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.Pr
 
 	for _, config := range providerConfigs {
 		providerURL := strings.TrimSpace(providerURLs[config.ExternalSubscriptionID])
+		if gatewayURL := strings.TrimSpace(gatewayURLs[config.ID]); gatewayURL != "" {
+			providerURL = gatewayURL
+		}
 		if providerURL == "" {
 			continue
 		}
