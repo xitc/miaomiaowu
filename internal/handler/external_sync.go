@@ -3,7 +3,10 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"miaomiaowu/internal/logger"
@@ -12,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowu/internal/auth"
@@ -22,6 +26,73 @@ import (
 )
 
 const defaultNodeNameFilterPattern = "剩余|流量|到期|订阅|时间|重置"
+
+const externalSyncSelectionTTL = 10 * time.Minute
+
+type externalSyncCandidate struct {
+	ID               string `json:"id"`
+	SubscriptionName string `json:"subscription_name"`
+	Name             string `json:"name"`
+	Protocol         string `json:"protocol"`
+	Server           string `json:"server"`
+	Port             any    `json:"port,omitempty"`
+	node             storage.Node
+}
+
+type externalSyncSelectionSession struct {
+	Username   string
+	ExpiresAt  time.Time
+	Candidates map[string]externalSyncCandidate
+}
+
+var externalSyncSelections = struct {
+	sync.Mutex
+	sessions map[string]externalSyncSelectionSession
+}{sessions: make(map[string]externalSyncSelectionSession)}
+
+type manualExternalSyncResult struct {
+	UpdatedCount int
+	Candidates   []externalSyncCandidate
+}
+
+func randomExternalSyncID() (string, error) {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+func storeExternalSyncSelection(username string, candidates []externalSyncCandidate) (string, error) {
+	if len(candidates) == 0 {
+		return "", nil
+	}
+	sessionID, err := randomExternalSyncID()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now()
+	items := make(map[string]externalSyncCandidate, len(candidates))
+	for i := range candidates {
+		id, err := randomExternalSyncID()
+		if err != nil {
+			return "", err
+		}
+		candidates[i].ID = id
+		items[id] = candidates[i]
+	}
+	externalSyncSelections.Lock()
+	defer externalSyncSelections.Unlock()
+	for id, session := range externalSyncSelections.sessions {
+		if now.After(session.ExpiresAt) {
+			delete(externalSyncSelections.sessions, id)
+		}
+	}
+	externalSyncSelections.sessions[sessionID] = externalSyncSelectionSession{
+		Username: username, ExpiresAt: now.Add(externalSyncSelectionTTL), Candidates: items,
+	}
+	return sessionID, nil
+}
 
 func applyNodeNameFilterToProxies(proxies []any, filterRegex *regexp.Regexp, filterPattern string) ([]any, int) {
 	if filterRegex == nil || len(proxies) == 0 {
@@ -48,9 +119,10 @@ func applyNodeNameFilterToProxies(proxies []any, filterRegex *regexp.Regexp, fil
 }
 
 // syncExternalSubscriptionsManual is for manual sync triggered by user - syncs ALL external subscriptions regardless of ForceSyncExternal setting
-func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string) error {
+func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string) (manualExternalSyncResult, error) {
+	var result manualExternalSyncResult
 	if repo == nil || username == "" {
-		return fmt.Errorf("invalid parameters")
+		return result, fmt.Errorf("invalid parameters")
 	}
 
 	logger.Info("[外部订阅同步-手动] 开始手动同步外部订阅", "user", username)
@@ -86,32 +158,32 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 	externalSubs, err := repo.ListExternalSubscriptions(ctx, username)
 	if err != nil {
 		logger.Info("[外部订阅同步-手动] 获取外部订阅列表失败", "error", err)
-		return fmt.Errorf("list external subscriptions: %w", err)
+		return result, fmt.Errorf("list external subscriptions: %w", err)
 	}
 
 	if len(externalSubs) == 0 {
 		logger.Info("[外部订阅同步-手动] 没有配置外部订阅，跳过同步", "user", username)
-		return nil
+		return result, nil
 	}
 
 	logger.Info("[外部订阅同步-手动] 外部订阅数量", "user", username, "count", len(externalSubs))
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := newSSRFSafeHTTPClient(30 * time.Second)
 
 	// Track total nodes synced
 	totalNodesSynced := 0
 
 	for i, sub := range externalSubs {
 		logger.Info("[外部订阅同步-手动] 开始同步订阅", "index", i+1, "total", len(externalSubs), "name", sub.Name)
-		nodeCount, updatedSub, err := syncSingleExternalSubscription(ctx, client, repo, subscribeDir, username, sub, userSettings)
+		nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, userSettings, true)
 		if err != nil {
 			logger.Info("[外部订阅同步-手动] 同步订阅失败", "index", i+1, "total", len(externalSubs), "name", sub.Name, "error", err)
 			continue
 		}
 
 		totalNodesSynced += nodeCount
+		result.UpdatedCount += nodeCount
+		result.Candidates = append(result.Candidates, candidates...)
 
 		// Update last sync time and node count
 		now := time.Now()
@@ -125,7 +197,7 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 
 	logger.Info("[外部订阅同步-手动] 同步完成", "user", username, "subscription_count", len(externalSubs), "total_nodes", totalNodesSynced)
 
-	return nil
+	return result, nil
 }
 
 // syncExternalSubscriptions fetches nodes from all external subscriptions and updates the node table
@@ -207,9 +279,7 @@ func syncExternalSubscriptions(ctx context.Context, repo *storage.TrafficReposit
 
 	logger.Info("[外部订阅同步-自动] 用户共有外部订阅需要同步", "user", username, "count", len(subsToSync))
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := newSSRFSafeHTTPClient(30 * time.Second)
 
 	// Track total nodes synced
 	totalNodesSynced := 0
@@ -292,22 +362,27 @@ func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficR
 func syncSingleExternalSubscription(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
 	key := externalSyncFlightKey(username, sub.ID)
 	return doExternalSyncSingleflight(key, func() (int, storage.ExternalSubscription, error) {
-		return syncSingleExternalSubscriptionLocked(ctx, client, repo, subscribeDir, username, sub, settings)
+		count, updatedSub, _, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, settings, false)
+		return count, updatedSub, err
 	})
 }
 
-func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
+func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings, deferNewNodes bool) (int, storage.ExternalSubscription, []externalSyncCandidate, error) {
+	var candidates []externalSyncCandidate
 	matchRule := settings.MatchRule
 	syncScope := settings.SyncScope
 	keepNodeName := settings.KeepNodeName
 
 	logger.Info("[外部订阅同步] 开始获取订阅内容", "name", sub.Name, "url", sub.URL)
 
+	if err := validateFetchURL(sub.URL); err != nil {
+		return 0, sub, nil, err
+	}
 	// Fetch subscription content
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
 		logger.Info("[外部订阅同步] 创建HTTP请求失败", "error", err)
-		return 0, sub, fmt.Errorf("create request: %w", err)
+		return 0, sub, nil, fmt.Errorf("create request: %w", err)
 	}
 
 	// 使用订阅保存的 User-Agent，如果为空则使用默认值
@@ -321,7 +396,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Info("[外部订阅同步] 请求订阅URL失败", "error", err)
-		return 0, sub, fmt.Errorf("fetch subscription: %w", err)
+		return 0, sub, nil, fmt.Errorf("fetch subscription: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -329,7 +404,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 
 	if resp.StatusCode != http.StatusOK {
 		logger.Info("[外部订阅同步] 订阅返回非200状态码", "status_code", resp.StatusCode)
-		return 0, sub, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return 0, sub, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	// Parse subscription-userinfo header if sync_traffic is enabled
@@ -362,10 +437,13 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 		}
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBodyBytes+1))
 	if err != nil {
 		logger.Info("[外部订阅同步] 读取响应内容失败", "error", err)
-		return 0, sub, fmt.Errorf("read response body: %w", err)
+		return 0, sub, nil, fmt.Errorf("read response body: %w", err)
+	}
+	if len(body) > maxFetchBodyBytes {
+		return 0, sub, nil, errors.New("subscription content exceeds 10MB limit")
 	}
 
 	// Reuse this exact upstream payload for provider filtering/tag refresh below.
@@ -407,7 +485,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 
 	if len(proxies) == 0 {
 		logger.Info("[外部订阅同步] 订阅中未找到节点(proxies)数据")
-		return 0, sub, fmt.Errorf("no proxies found in subscription")
+		return 0, sub, nil, fmt.Errorf("no proxies found in subscription")
 	}
 
 	logger.Info("[外部订阅同步] 解析到节点", "name", sub.Name, "count", len(proxies))
@@ -486,7 +564,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 
 	if len(nodesToUpdate) == 0 {
 		logger.Info("[外部订阅同步] 没有有效的节点可以同步")
-		return 0, sub, fmt.Errorf("no valid nodes to sync")
+		return 0, sub, nil, fmt.Errorf("no valid nodes to sync")
 	}
 
 	logger.Info("[外部订阅同步] 准备同步节点", "count", len(nodesToUpdate))
@@ -495,7 +573,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 	existingNodes, err := repo.ListNodes(ctx, username)
 	if err != nil {
 		logger.Info("[外部订阅同步] 获取已保存节点列表失败", "error", err)
-		return 0, sub, fmt.Errorf("list existing nodes: %w", err)
+		return 0, sub, nil, fmt.Errorf("list existing nodes: %w", err)
 	}
 
 	logger.Info("[外部订阅同步] 数据库中已有节点", "count", len(existingNodes))
@@ -536,6 +614,7 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 	var pendingUpdates []storage.Node
 	var yamlUpdates []NodeUpdate
 	var pendingCreates []storage.Node
+	touchedNodeIDs := make(map[int64]bool)
 
 	matchIndex := buildSourceNodeMatchIndex(existingNodes, sub.URL)
 
@@ -583,6 +662,9 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 				candidate.NodeName = oldNodeName
 			}
 
+			// Matched source nodes must stay for orphan cleanup even if payload is unchanged.
+			touchedNodeIDs[existingNode.ID] = true
+
 			if nodeSyncPayloadEqual(existingNode, candidate, keepNodeName) {
 				unchangedCount++
 				syncedCount++
@@ -606,6 +688,18 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 			syncedCount++
 			updatedCount++
 		} else {
+			// New node not found in existing nodes
+			if deferNewNodes {
+				candidate := externalSyncCandidate{
+					SubscriptionName: sub.Name, Name: node.NodeName,
+					Protocol: node.Protocol, node: node,
+				}
+				candidate.Server, _ = newNodeClashConfig["server"].(string)
+				candidate.Port = newNodeClashConfig["port"]
+				candidates = append(candidates, candidate)
+				continue
+			}
+			// Check sync scope: only create new nodes if syncScope is "all"
 			if syncScope == "all" {
 				pendingCreates = append(pendingCreates, node)
 				syncedCount++
@@ -619,13 +713,13 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 	if len(pendingUpdates) > 0 {
 		if err := repo.BatchUpdateNodesNoFetch(ctx, pendingUpdates); err != nil {
 			logger.Info("[外部订阅同步] 批量更新节点失败", "error", err, "count", len(pendingUpdates))
-			return 0, sub, fmt.Errorf("batch update nodes: %w", err)
+			return 0, sub, nil, fmt.Errorf("batch update nodes: %w", err)
 		}
 	}
 	if len(pendingCreates) > 0 {
 		if err := repo.BatchCreateNodesNoFetch(ctx, pendingCreates); err != nil {
 			logger.Info("[外部订阅同步] 批量创建节点失败", "error", err, "count", len(pendingCreates))
-			return 0, sub, fmt.Errorf("batch create nodes: %w", err)
+			return 0, sub, nil, fmt.Errorf("batch create nodes: %w", err)
 		}
 	}
 	// YAML: one read/parse/write pass per file for the whole batch
@@ -672,13 +766,43 @@ func syncSingleExternalSubscriptionLocked(ctx context.Context, client *http.Clie
 		}
 	}
 
+	// 清理该外部订阅中已不存在的节点（仅 syncScope=all），保证聚合订阅能随源节点减少而减少
+	if syncScope == "all" {
+		removedOrphans := 0
+		for _, existing := range existingNodes {
+			if existing.RawURL != sub.URL {
+				continue
+			}
+			if touchedNodeIDs[existing.ID] {
+				continue
+			}
+			if err := repo.DeleteNodeForSync(ctx, existing.ID, username); err != nil {
+				logger.Info("[外部订阅同步] 删除失效节点失败", "node_name", existing.NodeName, "id", existing.ID, "error", err)
+				continue
+			}
+			removedOrphans++
+			logger.Info("[外部订阅同步] 删除失效节点", "node_name", existing.NodeName, "id", existing.ID)
+			if subscribeDir != "" {
+				if err := deleteNodeFromYAMLFiles(subscribeDir, existing.NodeName); err != nil {
+					logger.Info("[外部订阅同步] 从YAML删除失效节点失败", "node_name", existing.NodeName, "error", err)
+				}
+			}
+		}
+		if removedOrphans > 0 {
+			logger.Info("[外部订阅同步] 清理失效节点完成", "name", sub.Name, "removed_count", removedOrphans)
+		}
+	}
+
 	// 同步代理集合节点到 YAML（仅处理 mmw 模式）
 	if err := syncProxyProviderNodesToYAML(ctx, repo, subscribeDir, username, sub); err != nil {
 		logger.Info("[外部订阅同步] 同步代理集合节点到YAML失败", "error", err)
 		// 不影响主流程，仅记录日志
 	}
 
-	return syncedCount, sub, nil
+	// 刷新绑定模板的订阅，使聚合/模板订阅及时反映节点变化
+	go RefreshAllTemplateSubscriptions(repo, username)
+
+	return syncedCount, sub, candidates, nil
 }
 
 // ParseTrafficInfoHeader parses subscription-userinfo header and returns traffic info
@@ -910,11 +1034,9 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 
 	logger.Info("[Sync API] 开始同步单个订阅 (ID)", "name", targetSub.Name, "id", targetSub.ID)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := newSSRFSafeHTTPClient(30 * time.Second)
 
-	nodeCount, updatedSub, err := syncSingleExternalSubscription(r.Context(), client, h.repo, h.subscribeDir, username, *targetSub, userSettings)
+	nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(r.Context(), client, h.repo, h.subscribeDir, username, *targetSub, userSettings, true)
 	if err != nil {
 		logger.Info("[Sync API] Failed to sync subscription", "name", targetSub.Name, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -933,12 +1055,17 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 		logger.Info("[Sync API] 更新订阅 的同步时间失败", "name", targetSub.Name, "error", err)
 	}
 
+	sessionID, err := storeExternalSyncSelection(username, candidates)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
+		return
+	}
 	logger.Info("[Sync API] Successfully synced subscription , synced nodes", "name", targetSub.Name, "param", nodeCount)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
-		"message":    fmt.Sprintf("订阅 %s 同步成功", targetSub.Name),
-		"node_count": nodeCount,
+		"message": fmt.Sprintf("订阅 %s 同步成功", targetSub.Name), "node_count": nodeCount,
+		"updated_count": nodeCount, "session_id": sessionID, "new_nodes": candidates,
 	})
 }
 
@@ -958,7 +1085,8 @@ func (h *SyncExternalSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *h
 	logger.Info("[Sync API] Manual sync triggered by user", "user", username)
 
 	// Use manual sync function which ignores ForceSyncExternal setting
-	if err := syncExternalSubscriptionsManual(r.Context(), h.repo, h.subscribeDir, username); err != nil {
+	result, err := syncExternalSubscriptionsManual(r.Context(), h.repo, h.subscribeDir, username)
+	if err != nil {
 		logger.Info("[Sync API] Failed to sync external subscriptions for user", "user", username, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -968,11 +1096,76 @@ func (h *SyncExternalSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *h
 		return
 	}
 
+	sessionID, err := storeExternalSyncSelection(username, result.Candidates)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
+		return
+	}
 	logger.Info("[Sync API] Successfully synced external subscriptions for user", "user", username)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "外部订阅同步成功",
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "外部订阅同步成功", "updated_count": result.UpdatedCount,
+		"session_id": sessionID, "new_nodes": result.Candidates,
+	})
+}
+
+type confirmExternalSyncRequest struct {
+	SessionID    string   `json:"session_id"`
+	CandidateIDs []string `json:"candidate_ids"`
+}
+
+func NewConfirmExternalSyncHandler(repo *storage.TrafficRepository) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		username := auth.UsernameFromContext(r.Context())
+		var req confirmExternalSyncRequest
+		if username == "" || json.NewDecoder(r.Body).Decode(&req) != nil || strings.TrimSpace(req.SessionID) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("invalid selection request"))
+			return
+		}
+		externalSyncSelections.Lock()
+		session, ok := externalSyncSelections.sessions[req.SessionID]
+		if ok && (session.Username != username || time.Now().After(session.ExpiresAt)) {
+			ok = false
+		}
+		if !ok {
+			externalSyncSelections.Unlock()
+			writeError(w, http.StatusGone, errors.New("selection session expired or not found"))
+			return
+		}
+		selected := make([]storage.Node, 0, len(req.CandidateIDs))
+		seen := make(map[string]struct{}, len(req.CandidateIDs))
+		for _, id := range req.CandidateIDs {
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			candidate, exists := session.Candidates[id]
+			if !exists {
+				externalSyncSelections.Unlock()
+				writeError(w, http.StatusBadRequest, errors.New("invalid candidate id"))
+				return
+			}
+			selected = append(selected, candidate.node)
+		}
+		delete(externalSyncSelections.sessions, req.SessionID)
+		externalSyncSelections.Unlock()
+		var created []storage.Node
+		if len(selected) > 0 {
+			var err error
+			created, err = repo.BatchCreateNodes(r.Context(), selected)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{
+			"message": fmt.Sprintf("已保存 %d 个新增节点", len(created)), "created_count": len(created),
+		})
 	})
 }
 
@@ -1489,4 +1682,111 @@ func formatTrafficShort(bytes int64) string {
 		return fmt.Sprintf("%.2fGB", float64(bytes)/float64(gb))
 	}
 	return fmt.Sprintf("%.0fMB", float64(bytes)/float64(mb))
+}
+
+// StartExternalSubscriptionAutoUpdateScheduler periodically syncs external subscriptions
+// that have AutoUpdate enabled, based on each subscription's UpdateIntervalMinutes.
+func StartExternalSubscriptionAutoUpdateScheduler(ctx context.Context, repo *storage.TrafficRepository, subscribeDir string) {
+	if repo == nil {
+		return
+	}
+
+	// 每分钟检查一次是否有到期的订阅
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	logger.Info("[外部订阅定时更新] 调度器已启动", "check_interval", "1分钟")
+
+	// 启动后稍等再跑第一轮，避免和启动其他任务抢资源
+	runExternalSubscriptionAutoUpdates(ctx, repo, subscribeDir)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("[外部订阅定时更新] 调度器已停止")
+			return
+		case <-ticker.C:
+			runExternalSubscriptionAutoUpdates(ctx, repo, subscribeDir)
+		}
+	}
+}
+
+func runExternalSubscriptionAutoUpdates(ctx context.Context, repo *storage.TrafficRepository, subscribeDir string) {
+	if repo == nil {
+		return
+	}
+
+	// 独立超时，避免单次任务拖垮后续检查
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	subs, err := repo.ListAllExternalSubscriptions(runCtx)
+	if err != nil {
+		logger.Info("[外部订阅定时更新] 获取订阅列表失败", "error", err)
+		return
+	}
+
+	now := time.Now()
+	client := newSSRFSafeHTTPClient(30 * time.Second)
+	settingsCache := make(map[string]storage.UserSettings)
+
+	synced := 0
+	for _, sub := range subs {
+		if !sub.AutoUpdate || sub.UpdateIntervalMinutes <= 0 {
+			continue
+		}
+
+		// 根据 last_sync_at 判断是否到期
+		if sub.LastSyncAt != nil {
+			elapsed := now.Sub(*sub.LastSyncAt)
+			if elapsed < time.Duration(sub.UpdateIntervalMinutes)*time.Minute {
+				continue
+			}
+		}
+
+		logger.Info("[外部订阅定时更新] 开始同步",
+			"user", sub.Username,
+			"name", sub.Name,
+			"interval_minutes", sub.UpdateIntervalMinutes)
+
+		userSettings, ok := settingsCache[sub.Username]
+		if !ok {
+			userSettings, err = repo.GetUserSettings(runCtx, sub.Username)
+			if err != nil {
+				logger.Info("[外部订阅定时更新] 获取用户设置失败，使用默认设置", "user", sub.Username, "error", err)
+				userSettings = storage.UserSettings{
+					MatchRule:      "node_name",
+					SyncScope:      "saved_only",
+					KeepNodeName:   true,
+					NodeNameFilter: defaultNodeNameFilterPattern,
+				}
+			}
+			settingsCache[sub.Username] = userSettings
+		}
+
+		nodeCount, updatedSub, err := syncSingleExternalSubscription(runCtx, client, repo, subscribeDir, sub.Username, sub, userSettings)
+		if err != nil {
+			logger.Info("[外部订阅定时更新] 同步失败", "user", sub.Username, "name", sub.Name, "error", err)
+			continue
+		}
+
+		syncTime := time.Now()
+		updatedSub.LastSyncAt = &syncTime
+		updatedSub.NodeCount = nodeCount
+		// 保留定时更新设置（sync 返回的 sub 已包含）
+		if err := repo.UpdateExternalSubscription(runCtx, updatedSub); err != nil {
+			logger.Info("[外部订阅定时更新] 更新同步时间失败", "user", sub.Username, "name", sub.Name, "error", err)
+			continue
+		}
+
+		synced++
+		logger.Info("[外部订阅定时更新] 同步完成",
+			"user", sub.Username,
+			"name", sub.Name,
+			"node_count", nodeCount)
+	}
+
+	if synced > 0 {
+		logger.Info("[外部订阅定时更新] 本轮完成", "synced", synced)
+	}
 }

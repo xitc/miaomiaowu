@@ -30,7 +30,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Calendar } from '@/components/ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
-import { Copy } from 'lucide-react'
+import { Copy, Layers} from 'lucide-react'
 import { Upload, Download, Edit, Settings, FileText, Save, Trash2, RefreshCw, ChevronDown, ChevronUp, ExternalLink, Eye, Calendar as CalendarIcon, Plus, Check, Ban, Info, Clock } from 'lucide-react'
 import { EditNodesDialog } from '@/components/edit-nodes-dialog'
 import { MobileEditNodesDialog } from '@/components/mobile-edit-nodes-dialog'
@@ -38,6 +38,8 @@ import { Twemoji } from '@/components/twemoji'
 import { useProxyGroupCategories } from '@/hooks/use-proxy-groups'
 import { translateOutbound } from '@/lib/sublink/translations'
 import { validateClashConfig, formatValidationIssues } from '@/lib/clash-validator'
+import { ExternalSyncNodeDialog } from '@/components/external-sync-node-dialog'
+import { useExternalSyncSelection } from '@/hooks/use-external-sync-selection'
 
 export const Route = createFileRoute('/subscribe-files/')({
   beforeLoad: () => {
@@ -101,6 +103,8 @@ type ExternalSubscription = {
   total: number
   expire: string | null
   traffic_mode: 'download' | 'upload' | 'both' | 'none'
+  auto_update: boolean
+  update_interval_minutes: number
   created_at: string
   updated_at: string
 }
@@ -273,6 +277,7 @@ function SubscribeFilesPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const isMobile = useMediaQuery('(max-width: 640px)')
+	const externalSyncSelection = useExternalSyncSelection()
 
   // 获取代理组配置
   const { data: proxyGroupCategories = [] } = useProxyGroupCategories()
@@ -304,6 +309,14 @@ function SubscribeFilesPage() {
   // 对话框状态
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false)
+  const [aggregateDialogOpen, setAggregateDialogOpen] = useState(false)
+  const [aggregateForm, setAggregateForm] = useState({
+    name: '',
+    description: '',
+    filename: '',
+    selected_tags: [] as string[],
+    template_filename: '',
+  })
   const [editDialogOpen, setEditDialogOpen] = useState(false)
   const [editingFile, setEditingFile] = useState<SubscribeFile | null>(null)
   const [editMetadataDialogOpen, setEditMetadataDialogOpen] = useState(false)
@@ -395,7 +408,9 @@ function SubscribeFilesPage() {
     name: '',
     url: '',
     user_agent: '',
-    traffic_mode: 'both' as 'download' | 'upload' | 'both' | 'none'
+    traffic_mode: 'both' as 'download' | 'upload' | 'both' | 'none',
+    auto_update: false,
+    update_interval_minutes: 60,
   })
 
   // 代理集合对话框状态
@@ -627,7 +642,7 @@ function SubscribeFilesPage() {
       const response = await api.post('/api/admin/subscribe-files/import', data)
       return response.data
     },
-    onSuccess: () => {
+		onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['subscribe-files'] })
       queryClient.invalidateQueries({ queryKey: ['user-subscriptions'] })
       toast.success('订阅导入成功')
@@ -722,6 +737,29 @@ function SubscribeFilesPage() {
     },
   })
 
+  // 创建聚合订阅
+  const createAggregateMutation = useMutation({
+    mutationFn: async (payload: {
+      name: string
+      description?: string
+      filename?: string
+      selected_tags: string[]
+      template_filename?: string
+    }) => {
+      const response = await api.post('/api/admin/subscribe-files/create-aggregate', payload)
+      return response.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['subscribe-files'] })
+      setAggregateDialogOpen(false)
+      setAggregateForm({ name: '', description: '', filename: '', selected_tags: [], template_filename: '' })
+      toast.success('聚合订阅已创建，将随源订阅节点自动更新')
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.error || '创建聚合订阅失败')
+    },
+  })
+
   // 更新订阅元数据
   const updateMetadataMutation = useMutation({
     mutationFn: async (payload: { id: number; data: typeof metadataForm }) => {
@@ -782,12 +820,22 @@ function SubscribeFilesPage() {
 
   // 更新外部订阅
   const updateExternalSubMutation = useMutation({
-    mutationFn: async (data: { id: number; name: string; url: string; user_agent: string; traffic_mode: string }) => {
+    mutationFn: async (data: {
+      id: number
+      name: string
+      url: string
+      user_agent: string
+      traffic_mode: string
+      auto_update?: boolean
+      update_interval_minutes?: number
+    }) => {
       await api.put(`/api/user/external-subscriptions?id=${data.id}`, {
         name: data.name,
         url: data.url,
         user_agent: data.user_agent,
-        traffic_mode: data.traffic_mode
+        traffic_mode: data.traffic_mode,
+        auto_update: data.auto_update,
+        update_interval_minutes: data.update_interval_minutes,
       })
     },
     onSuccess: () => {
@@ -810,7 +858,7 @@ function SubscribeFilesPage() {
       queryClient.invalidateQueries({ queryKey: ['external-subscriptions'] })
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
       queryClient.invalidateQueries({ queryKey: ['traffic-summary'] })
-      toast.success('外部订阅同步成功')
+		  if (!externalSyncSelection.present(data)) toast.success('外部订阅同步成功')
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.error || '同步失败')
@@ -825,12 +873,12 @@ function SubscribeFilesPage() {
       const response = await api.post(`/api/admin/sync-external-subscription?id=${id}`)
       return response.data
     },
-    onSuccess: (data: any) => {
+		onSuccess: (data: any) => {
       queryClient.invalidateQueries({ queryKey: ['external-subscriptions'] })
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
       queryClient.invalidateQueries({ queryKey: ['all-nodes-with-tags'] })
       queryClient.invalidateQueries({ queryKey: ['traffic-summary'] })
-      toast.success(data.message || '订阅同步成功')
+		  if (!externalSyncSelection.present(data)) toast.success(data.message || '订阅同步成功')
       setSyncingSingleId(null)
     },
     onError: (error: any) => {
@@ -1606,7 +1654,26 @@ function SubscribeFilesPage() {
     importMutation.mutate(importForm)
   }
 
-  const handleUpload = () => {
+  
+  const handleCreateAggregate = () => {
+    if (!aggregateForm.name.trim()) {
+      toast.error('请输入订阅名称')
+      return
+    }
+    if (aggregateForm.selected_tags.length === 0) {
+      toast.error('请至少选择一个源订阅/标签')
+      return
+    }
+    createAggregateMutation.mutate({
+      name: aggregateForm.name.trim(),
+      description: aggregateForm.description.trim() || undefined,
+      filename: aggregateForm.filename.trim() || undefined,
+      selected_tags: aggregateForm.selected_tags,
+      template_filename: aggregateForm.template_filename || undefined,
+    })
+  }
+
+const handleUpload = () => {
     if (!uploadFile) {
       toast.error('请选择文件')
       return
@@ -2738,6 +2805,140 @@ function SubscribeFilesPage() {
                       </Button>
                       <Button onClick={handleUpload} disabled={uploadMutation.isPending}>
                         {uploadMutation.isPending ? '上传中...' : (uploadForm.overwrite_id > 0 ? '覆盖上传' : '上传')}
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+                {/* 聚合订阅 */}
+                <Dialog open={aggregateDialogOpen} onOpenChange={(open) => {
+                  setAggregateDialogOpen(open)
+                  if (!open) {
+                    setAggregateForm({ name: '', description: '', filename: '', selected_tags: [], template_filename: '' })
+                  }
+                }}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <DialogTrigger asChild>
+                        <Button variant='outline' size='sm'>
+                          <Layers className='h-4 w-4' />
+                        </Button>
+                      </DialogTrigger>
+                    </TooltipTrigger>
+                    <TooltipContent>聚合订阅</TooltipContent>
+                  </Tooltip>
+                  <DialogContent className='sm:max-w-lg max-h-[90vh] flex flex-col'>
+                    <DialogHeader>
+                      <DialogTitle>聚合订阅</DialogTitle>
+                      <DialogDescription>
+                        选择多个外部订阅（按标签），生成一个会随源订阅节点自动更新的新订阅。
+                        源订阅节点从 100 变为 20 时，聚合订阅也会同步变为 20。
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className='space-y-4 py-2 overflow-y-auto flex-1 min-h-0'>
+                      <div className='space-y-2'>
+                        <Label htmlFor='aggregate-name'>订阅名称 *</Label>
+                        <Input
+                          id='aggregate-name'
+                          value={aggregateForm.name}
+                          onChange={(e) => setAggregateForm({ ...aggregateForm, name: e.target.value })}
+                          placeholder='例如：聚合机场'
+                        />
+                      </div>
+                      <div className='space-y-2'>
+                        <Label htmlFor='aggregate-desc'>说明（可选）</Label>
+                        <Textarea
+                          id='aggregate-desc'
+                          value={aggregateForm.description}
+                          onChange={(e) => setAggregateForm({ ...aggregateForm, description: e.target.value })}
+                          placeholder='留空将自动生成说明'
+                          rows={2}
+                        />
+                      </div>
+                      <div className='space-y-2'>
+                        <Label htmlFor='aggregate-filename'>文件名（可选）</Label>
+                        <Input
+                          id='aggregate-filename'
+                          value={aggregateForm.filename}
+                          onChange={(e) => setAggregateForm({ ...aggregateForm, filename: e.target.value })}
+                          placeholder='留空则使用订阅名称'
+                        />
+                      </div>
+                      <div className='space-y-2'>
+                        <Label>源订阅 / 标签 *</Label>
+                        <p className='text-xs text-muted-foreground'>
+                          外部订阅同步后会以订阅名作为节点标签。也可选择其它节点标签。
+                        </p>
+                        <div className='flex flex-wrap gap-2 max-h-[220px] overflow-y-auto border rounded-md p-3'>
+                          {(() => {
+                            const externalNames = externalSubs.map((s: any) => s.name).filter(Boolean)
+                            const tagSet = new Set<string>([...externalNames, ...allNodeTags])
+                            const options = Array.from(tagSet).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+                            if (options.length === 0) {
+                              return <span className='text-sm text-muted-foreground'>暂无可用标签，请先导入外部订阅或为节点打标签</span>
+                            }
+                            return options.map((tag) => {
+                              const selected = aggregateForm.selected_tags.includes(tag)
+                              const isExternal = externalNames.includes(tag)
+                              return (
+                                <Button
+                                  key={tag}
+                                  type='button'
+                                  size='sm'
+                                  variant={selected ? 'default' : 'outline'}
+                                  onClick={() => {
+                                    const next = selected
+                                      ? aggregateForm.selected_tags.filter((t) => t !== tag)
+                                      : [...aggregateForm.selected_tags, tag]
+                                    setAggregateForm({ ...aggregateForm, selected_tags: next })
+                                  }}
+                                >
+                                  {tag}
+                                </Button>
+                              )
+                            })
+                          })()}
+                        </div>
+                        {aggregateForm.selected_tags.length > 0 && (
+                          <p className='text-xs text-muted-foreground'>
+                            已选 {aggregateForm.selected_tags.length} 个：{aggregateForm.selected_tags.join('、')}
+                          </p>
+                        )}
+                      </div>
+                      <div className='space-y-2'>
+                        <Label>绑定 V3 模板（可选）</Label>
+                        <Select
+                          value={aggregateForm.template_filename || '__none__'}
+                          onValueChange={(v) => setAggregateForm({
+                            ...aggregateForm,
+                            template_filename: v === '__none__' ? '' : v,
+                          })}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder='不绑定模板' />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value='__none__'>不绑定模板（精简配置，实时节点）</SelectItem>
+                            {v3Templates.map((template: any) => (
+                              <SelectItem key={template.filename} value={template.filename}>
+                                {template.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className='text-xs text-muted-foreground'>
+                          绑定模板后，获取订阅时会按模板 + 所选标签动态生成；不绑定则输出精简 Clash 配置，节点同样实时更新。
+                        </p>
+                      </div>
+                    </div>
+                    <DialogFooter className='shrink-0'>
+                      <Button variant='outline' onClick={() => setAggregateDialogOpen(false)}>
+                        取消
+                      </Button>
+                      <Button
+                        onClick={handleCreateAggregate}
+                        disabled={createAggregateMutation.isPending}
+                      >
+                        {createAggregateMutation.isPending ? '创建中...' : '创建聚合订阅'}
                       </Button>
                     </DialogFooter>
                   </DialogContent>
@@ -4106,7 +4307,18 @@ function SubscribeFilesPage() {
                   columns={[
                     {
                       header: '名称',
-                      cell: (sub) => sub.name,
+                      cell: (sub) => (
+                        <div className='flex flex-col gap-1'>
+                          <span>{sub.name}</span>
+                          {sub.auto_update && (
+                            <Badge variant='secondary' className='w-fit text-[10px]'>
+                              定时 {sub.update_interval_minutes >= 60
+                                ? `${Math.round(sub.update_interval_minutes / 60)}h`
+                                : `${sub.update_interval_minutes}m`}
+                            </Badge>
+                          )}
+                        </div>
+                      ),
                       cellClassName: 'font-medium'
                     },
                     {
@@ -4324,7 +4536,9 @@ function SubscribeFilesPage() {
                                 name: sub.name,
                                 url: sub.url,
                                 user_agent: sub.user_agent,
-                                traffic_mode: sub.traffic_mode || 'both'
+                                traffic_mode: sub.traffic_mode || 'both',
+                                auto_update: Boolean(sub.auto_update),
+                                update_interval_minutes: sub.update_interval_minutes > 0 ? sub.update_interval_minutes : 60,
                               })
                               setEditExternalSubDialogOpen(true)
                             }}
@@ -4398,6 +4612,13 @@ function SubscribeFilesPage() {
                             </TooltipContent>
                           </Tooltip>
                           <div className='font-medium text-sm truncate'>{sub.name}</div>
+                          {sub.auto_update && (
+                            <div className='text-[10px] text-muted-foreground'>
+                              定时更新 · {sub.update_interval_minutes >= 60
+                                ? `${Math.round(sub.update_interval_minutes / 60)} 小时`
+                                : `${sub.update_interval_minutes} 分钟`}
+                            </div>
+                          )}
                         </div>
                         <div className='flex items-center gap-1'>
                           <Button
@@ -4411,7 +4632,9 @@ function SubscribeFilesPage() {
                                 name: sub.name,
                                 url: sub.url,
                                 user_agent: sub.user_agent,
-                                traffic_mode: sub.traffic_mode || 'both'
+                                traffic_mode: sub.traffic_mode || 'both',
+                                auto_update: Boolean(sub.auto_update),
+                                update_interval_minutes: sub.update_interval_minutes > 0 ? sub.update_interval_minutes : 60,
                               })
                               setEditExternalSubDialogOpen(true)
                             }}
@@ -6641,6 +6864,46 @@ function SubscribeFilesPage() {
                 选择如何计算已用流量：上下行为两者相加，仅下行或仅上行则只计算对应流量
               </p>
             </div>
+            <div className='space-y-2 rounded-md border p-3'>
+              <div className='flex items-center justify-between gap-3'>
+                <div className='space-y-1'>
+                  <Label htmlFor='edit-sub-auto-update' className='text-sm font-medium cursor-pointer'>
+                    定时更新此订阅
+                  </Label>
+                  <p className='text-xs text-muted-foreground'>
+                    开启后服务端按间隔自动拉取并同步节点
+                  </p>
+                </div>
+                <Switch
+                  id='edit-sub-auto-update'
+                  checked={editExternalSubForm.auto_update}
+                  onCheckedChange={(checked) => setEditExternalSubForm(prev => ({ ...prev, auto_update: checked }))}
+                />
+              </div>
+              {editExternalSubForm.auto_update && (
+                <div className='flex flex-wrap items-center gap-2 pt-1'>
+                  <Label htmlFor='edit-sub-update-interval' className='text-sm whitespace-nowrap'>
+                    更新间隔
+                  </Label>
+                  <Select
+                    value={String(editExternalSubForm.update_interval_minutes)}
+                    onValueChange={(v) => setEditExternalSubForm(prev => ({ ...prev, update_interval_minutes: Number(v) }))}
+                  >
+                    <SelectTrigger id='edit-sub-update-interval' className='w-[160px]'>
+                      <SelectValue placeholder='选择间隔' />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='30'>30 分钟</SelectItem>
+                      <SelectItem value='60'>1 小时</SelectItem>
+                      <SelectItem value='180'>3 小时</SelectItem>
+                      <SelectItem value='360'>6 小时</SelectItem>
+                      <SelectItem value='720'>12 小时</SelectItem>
+                      <SelectItem value='1440'>24 小时</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+            </div>
           </div>
           <DialogFooter>
             <Button variant='outline' onClick={() => setEditExternalSubDialogOpen(false)}>
@@ -6654,7 +6917,9 @@ function SubscribeFilesPage() {
                     name: editingExternalSub.name,
                     url: editExternalSubForm.url,
                     user_agent: editingExternalSub.user_agent,
-                    traffic_mode: editExternalSubForm.traffic_mode
+                    traffic_mode: editExternalSubForm.traffic_mode,
+                    auto_update: editExternalSubForm.auto_update,
+                    update_interval_minutes: editExternalSubForm.update_interval_minutes,
                   })
                   setEditExternalSubDialogOpen(false)
                   setEditingExternalSub(null)
@@ -6666,8 +6931,15 @@ function SubscribeFilesPage() {
             </Button>
           </DialogFooter>
         </DialogContent>
-      </Dialog>
-    </main>
+		</Dialog>
+		<ExternalSyncNodeDialog
+		  selection={externalSyncSelection.selection}
+		  saving={externalSyncSelection.confirming}
+		  onSelectionChange={externalSyncSelection.setSelectedIds}
+		  onCancel={externalSyncSelection.cancel}
+		  onConfirm={externalSyncSelection.confirm}
+		/>
+	  </main>
   )
 }
 
