@@ -651,6 +651,12 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 			existing.ExpireAt = expireAt
 		}
 	}
+	// 「延长30天」等：计费起点重置为按下按钮的那一刻，已用从 0 重新折算。
+	if req.ResetTrafficStart != nil && *req.ResetTrafficStart {
+		now := time.Now().UTC()
+		existing.TrafficStartAt = &now
+		logger.Info("[订阅文件] 重置自定义流量计费起点", "id", existing.ID, "name", existing.Name, "traffic_start_at", now)
+	}
 
 	// 处理文件名更新
 	oldFilename := existing.Filename
@@ -834,6 +840,8 @@ type subscribeFileRequest struct {
 	DefaultOutputMode         *string  `json:"default_output_mode,omitempty"`
 	TrafficLimit              *float64 `json:"traffic_limit,omitempty"`
 	StatsServerIDs            *string  `json:"stats_server_ids,omitempty"`
+	// ResetTrafficStart when true sets traffic_start_at to now (e.g. 「延长30天」).
+	ResetTrafficStart *bool `json:"reset_traffic_start,omitempty"`
 }
 
 func firstNonEmpty(values ...string) string {

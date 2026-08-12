@@ -3009,23 +3009,33 @@ const handleUpload = () => {
                         } else if (days instanceof Date) {
                           newExpireAt = days.toISOString()
                         } else {
-                          const baseDate = file.expire_at ? new Date(file.expire_at) : new Date()
+                          // 延期：以「现在」和当前到期中较晚者为基点，避免已过期再 +30 天仍落在过去
+                          const now = new Date()
+                          const currentExpire = file.expire_at ? new Date(file.expire_at) : now
+                          const baseDate = currentExpire > now ? currentExpire : now
                           newExpireAt = addDays(baseDate, days).toISOString()
+                        }
+
+                        const payload: Record<string, unknown> = {
+                          name: file.name,
+                          description: file.description,
+                          auto_sync_custom_rules: file.auto_sync_custom_rules,
+                          expire_at: newExpireAt,
+                        }
+                        // 延长 30 天：计费起点重置为按下那一刻，流量从满额重新按剩余时间折算
+                        if (days === 30) {
+                          payload.reset_traffic_start = true
                         }
 
                         updateMetadataMutation.mutate({
                           id: file.id,
-                          data: {
-                            name: file.name,
-                            description: file.description,
-                            auto_sync_custom_rules: file.auto_sync_custom_rules,
-                            expire_at: newExpireAt,
-                          }
+                          data: payload,
                         }, {
                           onSuccess: () => {
                             setExpirePopoverFileId(null)
                             setCustomDateFileId(null)
-                            toast.success('过期时间已更新')
+                            toast.success(days === 30 ? '已延长 30 天，流量计费周期已重置' : '过期时间已更新')
+                            queryClient.invalidateQueries({ queryKey: ['subscribe-traffic'] })
                           }
                         })
                       }
@@ -3729,7 +3739,7 @@ const handleUpload = () => {
                                 className='h-8 text-sm'
                               />
                               <p className='text-[11px] text-muted-foreground leading-snug'>
-                                自定义流量（无探针时）：默认按 30 天周期回推起点（起点=到期−30天），再按剩余时间比例扣减。剩余越少已用越高。
+                                自定义流量（无探针时）：按剩余时间比例扣减。点「延长30天」会把计费起点重置为当下，已用重新从 0 计。
                               </p>
                             </div>
                             <div className='space-y-1'>
@@ -4096,23 +4106,31 @@ const handleUpload = () => {
                           } else if (days instanceof Date) {
                             newExpireAt = days.toISOString()
                           } else {
-                            const baseDate = file.expire_at ? new Date(file.expire_at) : new Date()
+                            const now = new Date()
+                            const currentExpire = file.expire_at ? new Date(file.expire_at) : now
+                            const baseDate = currentExpire > now ? currentExpire : now
                             newExpireAt = addDays(baseDate, days).toISOString()
+                          }
+
+                          const payload: Record<string, unknown> = {
+                            name: file.name,
+                            description: file.description,
+                            auto_sync_custom_rules: file.auto_sync_custom_rules,
+                            expire_at: newExpireAt,
+                          }
+                          if (days === 30) {
+                            payload.reset_traffic_start = true
                           }
 
                           updateMetadataMutation.mutate({
                             id: file.id,
-                            data: {
-                              name: file.name,
-                              description: file.description,
-                              auto_sync_custom_rules: file.auto_sync_custom_rules,
-                              expire_at: newExpireAt,
-                            }
+                            data: payload,
                           }, {
                             onSuccess: () => {
                               setMobileExpirePopoverFileId(null)
                               setMobileCustomDateFileId(null)
-                              toast.success('过期时间已更新')
+                              toast.success(days === 30 ? '已延长 30 天，流量计费周期已重置' : '过期时间已更新')
+                              queryClient.invalidateQueries({ queryKey: ['subscribe-traffic'] })
                             }
                           })
                         }
@@ -5847,7 +5865,7 @@ const handleUpload = () => {
                 placeholder='例如 500；留空则跟随探针'
               />
               <p className='text-xs text-muted-foreground'>
-                填写后作为订阅 total。无探针时按剩余时间比例扣减：默认周期 30 天（起点≈到期−30天）；临近到期则已用偏高、剩余偏低。仅有到期未填流量时也会下发 expire。
+                填写后作为订阅 total。无探针时按剩余时间比例扣减。点「延长30天」会把计费起点重置为按下那一刻（已用从近 0 重新计）。仅有到期未填流量时也会下发 expire。
               </p>
             </div>
             <div className='space-y-2'>
