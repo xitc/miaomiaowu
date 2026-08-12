@@ -16,7 +16,7 @@ const (
 )
 
 // Shared column list for subscribe_files reads (order must match scanSubscribeFile).
-const subscribeFileSelectColumns = `id, name, COALESCE(description, ''), url, type, filename, COALESCE(file_short_code, ''), COALESCE(custom_short_code, ''), COALESCE(auto_sync_custom_rules, 0), COALESCE(template_filename, ''), COALESCE(normal_template_filename, ''), COALESCE(provider_template_filename, ''), COALESCE(selected_tags, '[]'), COALESCE(selected_node_ids, '[]'), COALESCE(selected_custom_rule_ids, '[]'), COALESCE(selected_override_script_ids, '[]'), COALESCE(selected_provider_names, '[]'), expire_at, COALESCE(raw_output, 0), COALESCE(normal_link_enabled, 1), COALESCE(provider_link_enabled, 0), COALESCE(default_output_mode, 'normal'), COALESCE(sort_order, 0), created_at, updated_at, traffic_limit, COALESCE(stats_server_ids, '')`
+const subscribeFileSelectColumns = `id, name, COALESCE(description, ''), url, type, filename, COALESCE(file_short_code, ''), COALESCE(custom_short_code, ''), COALESCE(auto_sync_custom_rules, 0), COALESCE(template_filename, ''), COALESCE(normal_template_filename, ''), COALESCE(provider_template_filename, ''), COALESCE(selected_tags, '[]'), COALESCE(selected_node_ids, '[]'), COALESCE(selected_custom_rule_ids, '[]'), COALESCE(selected_override_script_ids, '[]'), COALESCE(selected_provider_names, '[]'), expire_at, COALESCE(raw_output, 0), COALESCE(normal_link_enabled, 1), COALESCE(provider_link_enabled, 0), COALESCE(default_output_mode, 'normal'), COALESCE(sort_order, 0), created_at, updated_at, traffic_limit, traffic_start_at, COALESCE(stats_server_ids, '')`
 
 type sqlScanner interface {
 	Scan(dest ...any) error
@@ -48,6 +48,7 @@ func scanSubscribeFile(scanner sqlScanner) (SubscribeFile, error) {
 	var providerLinkEnabled int
 	var defaultOutputMode string
 	var expireAt sql.NullTime
+	var trafficStartAt sql.NullTime
 	var selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON string
 	var trafficLimit sql.NullFloat64
 	if err := scanner.Scan(
@@ -55,7 +56,7 @@ func scanSubscribeFile(scanner sqlScanner) (SubscribeFile, error) {
 		&file.FileShortCode, &file.CustomShortCode, &autoSync, &file.TemplateFilename, &file.NormalTemplateFilename, &file.ProviderTemplateFilename,
 		&selectedTagsJSON, &selectedNodeIDsJSON, &selectedRuleIDsJSON, &selectedScriptIDsJSON, &selectedProviderNamesJSON,
 		&expireAt, &rawOutput, &normalLinkEnabled, &providerLinkEnabled, &defaultOutputMode,
-		&file.SortOrder, &file.CreatedAt, &file.UpdatedAt, &trafficLimit, &file.StatsServerIDs,
+		&file.SortOrder, &file.CreatedAt, &file.UpdatedAt, &trafficLimit, &trafficStartAt, &file.StatsServerIDs,
 	); err != nil {
 		return file, err
 	}
@@ -70,6 +71,10 @@ func scanSubscribeFile(scanner sqlScanner) (SubscribeFile, error) {
 	if trafficLimit.Valid {
 		v := trafficLimit.Float64
 		file.TrafficLimit = &v
+	}
+	if trafficStartAt.Valid {
+		t := trafficStartAt.Time
+		file.TrafficStartAt = &t
 	}
 	parseSubscribeFileJSONFields(&file, selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON)
 	return file, nil
@@ -219,6 +224,10 @@ func (r *TrafficRepository) CreateSubscribeFile(ctx context.Context, file Subscr
 	if file.ExpireAt != nil {
 		expireAt = *file.ExpireAt
 	}
+	var trafficStartAt any
+	if file.TrafficStartAt != nil {
+		trafficStartAt = *file.TrafficStartAt
+	}
 	// Serialize JSON fields
 	selectedTagsJSON := "[]"
 	if len(file.SelectedTags) > 0 {
@@ -251,8 +260,8 @@ func (r *TrafficRepository) CreateSubscribeFile(ctx context.Context, file Subscr
 
 		// Default auto_sync_custom_rules to 1 (enabled) for new subscribe files
 		// template_filename 默认为空，创建时不绑定模板
-		res, err := r.db.ExecContext(ctx, `INSERT INTO subscribe_files (name, description, url, type, filename, file_short_code, auto_sync_custom_rules, template_filename, normal_template_filename, provider_template_filename, selected_tags, selected_node_ids, selected_custom_rule_ids, selected_override_script_ids, selected_provider_names, expire_at, raw_output, normal_link_enabled, provider_link_enabled, default_output_mode, traffic_limit, stats_server_ids) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			file.Name, file.Description, file.URL, file.Type, file.Filename, newFileShortCode, file.TemplateFilename, file.NormalTemplateFilename, file.ProviderTemplateFilename, selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON, expireAt, boolToInt(file.RawOutput), boolToInt(file.NormalLinkEnabled), boolToInt(file.ProviderLinkEnabled), NormalizeDefaultOutputMode(file.DefaultOutputMode), file.TrafficLimit, file.StatsServerIDs)
+		res, err := r.db.ExecContext(ctx, `INSERT INTO subscribe_files (name, description, url, type, filename, file_short_code, auto_sync_custom_rules, template_filename, normal_template_filename, provider_template_filename, selected_tags, selected_node_ids, selected_custom_rule_ids, selected_override_script_ids, selected_provider_names, expire_at, raw_output, normal_link_enabled, provider_link_enabled, default_output_mode, traffic_limit, traffic_start_at, stats_server_ids) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			file.Name, file.Description, file.URL, file.Type, file.Filename, newFileShortCode, file.TemplateFilename, file.NormalTemplateFilename, file.ProviderTemplateFilename, selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON, expireAt, boolToInt(file.RawOutput), boolToInt(file.NormalLinkEnabled), boolToInt(file.ProviderLinkEnabled), NormalizeDefaultOutputMode(file.DefaultOutputMode), file.TrafficLimit, trafficStartAt, file.StatsServerIDs)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") && strings.Contains(strings.ToLower(err.Error()), "file_short_code") {
 				// File short code collision, retry
@@ -313,6 +322,10 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 	if file.ExpireAt != nil {
 		expireAt = *file.ExpireAt
 	}
+	var trafficStartAt any
+	if file.TrafficStartAt != nil {
+		trafficStartAt = *file.TrafficStartAt
+	}
 	// Serialize JSON fields
 	selectedTagsJSON := "[]"
 	if len(file.SelectedTags) > 0 {
@@ -324,8 +337,8 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 	selectedRuleIDsJSON := serializeInt64Slice(file.SelectedCustomRuleIDs)
 	selectedScriptIDsJSON := serializeInt64Slice(file.SelectedOverrideScriptIDs)
 	selectedProviderNamesJSON := serializeStringSlice(file.SelectedProviderNames)
-	res, err := r.db.ExecContext(ctx, `UPDATE subscribe_files SET name = ?, description = ?, url = ?, type = ?, filename = ?, auto_sync_custom_rules = ?, template_filename = ?, normal_template_filename = ?, provider_template_filename = ?, selected_tags = ?, selected_node_ids = ?, selected_custom_rule_ids = ?, selected_override_script_ids = ?, selected_provider_names = ?, custom_short_code = ?, expire_at = ?, raw_output = ?, normal_link_enabled = ?, provider_link_enabled = ?, default_output_mode = ?, traffic_limit = ?, stats_server_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		file.Name, file.Description, file.URL, file.Type, file.Filename, autoSyncInt, file.TemplateFilename, file.NormalTemplateFilename, file.ProviderTemplateFilename, selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON, file.CustomShortCode, expireAt, boolToInt(file.RawOutput), boolToInt(file.NormalLinkEnabled), boolToInt(file.ProviderLinkEnabled), NormalizeDefaultOutputMode(file.DefaultOutputMode), file.TrafficLimit, file.StatsServerIDs, file.ID)
+	res, err := r.db.ExecContext(ctx, `UPDATE subscribe_files SET name = ?, description = ?, url = ?, type = ?, filename = ?, auto_sync_custom_rules = ?, template_filename = ?, normal_template_filename = ?, provider_template_filename = ?, selected_tags = ?, selected_node_ids = ?, selected_custom_rule_ids = ?, selected_override_script_ids = ?, selected_provider_names = ?, custom_short_code = ?, expire_at = ?, raw_output = ?, normal_link_enabled = ?, provider_link_enabled = ?, default_output_mode = ?, traffic_limit = ?, traffic_start_at = ?, stats_server_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		file.Name, file.Description, file.URL, file.Type, file.Filename, autoSyncInt, file.TemplateFilename, file.NormalTemplateFilename, file.ProviderTemplateFilename, selectedTagsJSON, selectedNodeIDsJSON, selectedRuleIDsJSON, selectedScriptIDsJSON, selectedProviderNamesJSON, file.CustomShortCode, expireAt, boolToInt(file.RawOutput), boolToInt(file.NormalLinkEnabled), boolToInt(file.ProviderLinkEnabled), NormalizeDefaultOutputMode(file.DefaultOutputMode), file.TrafficLimit, trafficStartAt, file.StatsServerIDs, file.ID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return SubscribeFile{}, ErrSubscribeFileExists

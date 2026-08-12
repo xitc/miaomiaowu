@@ -556,6 +556,15 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	}
 	if req.TrafficLimit != nil {
 		existing.TrafficLimit = req.TrafficLimit
+		if *req.TrafficLimit <= 0 {
+			// Treat non-positive as clearing custom quota.
+			existing.TrafficLimit = nil
+			existing.TrafficStartAt = nil
+		} else if existing.TrafficStartAt == nil {
+			// First enable of custom traffic: cycle starts now (remaining-day model).
+			now := time.Now().UTC()
+			existing.TrafficStartAt = &now
+		}
 	}
 	if req.StatsServerIDs != nil {
 		existing.StatsServerIDs = *req.StatsServerIDs

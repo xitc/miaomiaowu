@@ -40,6 +40,7 @@ CREATE TABLE subscribe_files (
   raw_output INTEGER NOT NULL DEFAULT 0,
   sort_order INTEGER NOT NULL DEFAULT 0,
   traffic_limit REAL,
+  traffic_start_at TIMESTAMP,
   stats_server_ids TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP

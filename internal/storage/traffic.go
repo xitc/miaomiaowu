@@ -249,6 +249,7 @@ type SubscribeFile struct {
 	DefaultOutputMode         string     // 默认输出模式：normal | provider
 	SortOrder                 int        // 排序权重，值越小越靠前
 	TrafficLimit              *float64   // 手动设置的总流量上限(GB)，nil表示跟随探针
+	TrafficStartAt            *time.Time // 自定义流量计费周期起点；按剩余天数折算时使用
 	StatsServerIDs            string     // 统计服务器的探针服务器ID列表(逗号分隔)
 	ExpireAt                  *time.Time // Optional expiration timestamp
 	CreatedAt                 time.Time
@@ -1004,6 +1005,11 @@ CREATE INDEX IF NOT EXISTS idx_external_subscriptions_url ON external_subscripti
 
 	// Add traffic_limit column to subscribe_files table
 	if err := r.ensureSubscribeFileColumn("traffic_limit", "REAL"); err != nil {
+		return err
+	}
+
+	// Custom traffic billing cycle start (remaining-day simulation)
+	if err := r.ensureSubscribeFileColumn("traffic_start_at", "TIMESTAMP"); err != nil {
 		return err
 	}
 
