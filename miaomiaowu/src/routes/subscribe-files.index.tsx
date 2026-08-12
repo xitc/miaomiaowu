@@ -3665,17 +3665,23 @@ const handleUpload = () => {
 
                       const progressBar = (() => {
                         if (!displayTraffic || displayTraffic.limit_gb === 0) {
-                          return <span className='text-muted-foreground text-xs'>未配置探针</span>
+                          return (
+                            <span className='text-muted-foreground text-xs'>
+                              {file.expire_at && !file.traffic_limit ? '仅到期' : '点击设置'}
+                            </span>
+                          )
                         }
                         const percentage = Math.min((displayTraffic.used_gb / displayTraffic.limit_gb) * 100, 100)
                         const remainingGB = Math.max(displayTraffic.limit_gb - displayTraffic.used_gb, 0)
+                        const isSimulated = file.traffic_limit != null && !file.stats_server_ids
                         return (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <div className='w-20 space-y-1 cursor-pointer'>
                                 <Progress value={percentage} className='h-2' />
                                 <div className='text-xs text-center text-muted-foreground'>
-                                  {percentage.toFixed(0)}%{!isCustom && ' (默认)'}
+                                  {percentage.toFixed(0)}%
+                                  {isSimulated ? ' (模拟)' : !isCustom ? ' (默认)' : ''}
                                 </div>
                               </div>
                             </TooltipTrigger>
@@ -3692,6 +3698,11 @@ const handleUpload = () => {
                                 <span className='font-medium'>剩余: </span>
                                 {remainingGB.toFixed(2)} GB
                               </div>
+                              {isSimulated && (
+                                <div className='text-xs text-muted-foreground'>
+                                  按创建→到期天数百分比模拟抵扣
+                                </div>
+                              )}
                               {!isCustom && <div className='text-xs text-muted-foreground'>点击可设置独立流量</div>}
                             </TooltipContent>
                           </Tooltip>
@@ -3707,19 +3718,22 @@ const handleUpload = () => {
                           </PopoverTrigger>
                           <PopoverContent className='w-72 space-y-3' align='center'>
                             <div className='space-y-1'>
-                              <Label className='text-xs'>总流量上限（GB）</Label>
+                              <Label className='text-xs'>自定义总流量（GB）</Label>
                               <Input
                                 type='number'
                                 min='0'
                                 step='0.01'
-                                placeholder='留空则使用探针总流量'
+                                placeholder='如 500；留空则跟随探针'
                                 defaultValue={file.traffic_limit != null ? String(file.traffic_limit) : ''}
                                 ref={(el) => { trafficInputRef = el }}
                                 className='h-8 text-sm'
                               />
+                              <p className='text-[11px] text-muted-foreground leading-snug'>
+                                仅填自定义流量、不选统计服务器时：按「创建→到期」天数百分比模拟已用流量，并写入 subscription-userinfo。
+                              </p>
                             </div>
                             <div className='space-y-1'>
-                              <Label className='text-xs'>统计服务器</Label>
+                              <Label className='text-xs'>统计服务器（真实探针，优先）</Label>
                               {probeServers.length > 0 ? (
                                 <div className='flex flex-wrap gap-1'>
                                   {probeServers.map((srv) => {
@@ -5822,7 +5836,7 @@ const handleUpload = () => {
               </div>
             )}
             <div className='space-y-2'>
-              <Label htmlFor='traffic-limit'>总流量上限（GB，可选）</Label>
+              <Label htmlFor='traffic-limit'>自定义总流量（GB，可选）</Label>
               <Input
                 id='traffic-limit'
                 type='number'
@@ -5830,14 +5844,15 @@ const handleUpload = () => {
                 step='0.01'
                 value={metadataForm.traffic_limit}
                 onChange={(e) => setMetadataForm({ ...metadataForm, traffic_limit: e.target.value })}
-                placeholder='留空则使用探针服务器的总流量'
+                placeholder='例如 500；留空则跟随探针'
               />
               <p className='text-xs text-muted-foreground'>
-                手动设置总流量上限，订阅信息中的总流量将使用此值。留空则跟随探针。
+                填写后作为订阅 total 流量。不选下方统计服务器时，已用流量按「创建日期 → 到期时间」线性百分比模拟抵扣（到期用完）。
+                仅有到期时间、未填流量时也会下发 expire 到 subscription-userinfo。
               </p>
             </div>
             <div className='space-y-2'>
-              <Label>统计服务器（可选）</Label>
+              <Label>统计服务器（可选，真实探针）</Label>
               {probeServers.length > 0 ? (
                 <>
                   <div className='flex flex-wrap gap-2'>

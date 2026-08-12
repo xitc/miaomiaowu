@@ -1443,6 +1443,7 @@ func (h *TrafficSummaryHandler) HandleSubscribeTraffic(w http.ResponseWriter, r 
 
 	var items []subTraffic
 
+	now := time.Now()
 	for _, f := range files {
 		if f.TrafficLimit == nil && f.StatsServerIDs == "" {
 			continue
@@ -1461,6 +1462,10 @@ func (h *TrafficSummaryHandler) HandleSubscribeTraffic(w http.ResponseWriter, r 
 				}
 				usedBytes = statsUsed
 			}
+		} else if simLimit, simUsed, ok := resolveCustomSimulatedTraffic(f, now); ok {
+			// 自定义流量：按订阅创建→到期 天数百分比模拟已用
+			limitBytes = simLimit
+			usedBytes = simUsed
 		} else if f.TrafficLimit != nil {
 			limitBytes = int64(*f.TrafficLimit * bytesPerGigabyte)
 			_, _, totalUsed, probeErr := h.fetchTotals(ctx, "", nil)

@@ -930,7 +930,21 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 								if cfgErr == nil && sysConfig.EnableSubInfoNodes {
 									// 计算剩余流量
 									var remainingTraffic int64
-									if hasTrafficInfo || externalTrafficLimit > 0 {
+									if hasSubscribeFile {
+										if simLimit, simUsed, ok := resolveCustomSimulatedTraffic(subscribeFile, time.Now()); ok {
+											remainingTraffic = simLimit - simUsed
+											if remainingTraffic < 0 {
+												remainingTraffic = 0
+											}
+										} else if hasTrafficInfo || externalTrafficLimit > 0 {
+											includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+											if includeProbeTraffic && hasTrafficInfo {
+												remainingTraffic = (totalLimit + externalTrafficLimit) - (totalUsed + externalTrafficUsed)
+											} else {
+												remainingTraffic = externalTrafficLimit - externalTrafficUsed
+											}
+										}
+									} else if hasTrafficInfo || externalTrafficLimit > 0 {
 										includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
 										if includeProbeTraffic && hasTrafficInfo {
 											remainingTraffic = (totalLimit + externalTrafficLimit) - (totalUsed + externalTrafficUsed)
@@ -1043,9 +1057,11 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", contentType)
-	// 只有在启用了订阅流量响应头且有流量信息时才添加 subscription-userinfo 头
-	if enableSubTrafficHeader && (hasTrafficInfo || externalTrafficLimit > 0) {
+	// 启用流量头时：探针/外部流量，或订阅自定义流量/过期时间，都可写入 subscription-userinfo
+	hasCustomTrafficMeta := hasSubscribeFile && (subscribeFile.TrafficLimit != nil || subscribeFile.ExpireAt != nil || subscribeFile.StatsServerIDs != "")
+	if enableSubTrafficHeader && (hasTrafficInfo || externalTrafficLimit > 0 || hasCustomTrafficMeta) {
 		var finalLimit, finalUsed int64
+		trafficSource := "probe_or_external"
 
 		if hasSubscribeFile && subscribeFile.StatsServerIDs != "" {
 			// 订阅文件配置了统计服务器，按 server_id 过滤探针流量（优先级最高）
@@ -1053,23 +1069,49 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			statsLimit, _, statsUsed, statsErr := h.summary.fetchTotalsByServerIDs(r.Context(), idList)
 			if statsErr == nil {
 				if subscribeFile.TrafficLimit != nil {
-					finalLimit = int64(*subscribeFile.TrafficLimit*1024*1024*1024) + externalTrafficLimit
+					finalLimit = trafficLimitBytes(subscribeFile.TrafficLimit) + externalTrafficLimit
 				} else {
 					finalLimit = statsLimit + externalTrafficLimit
 				}
 				finalUsed = statsUsed + externalTrafficUsed
+				trafficSource = "stats_servers"
 			} else {
 				finalLimit = externalTrafficLimit
 				finalUsed = externalTrafficUsed
+				trafficSource = "stats_fallback_external"
 			}
-		} else if hasSubscribeFile && subscribeFile.TrafficLimit != nil {
-			// 仅配置了总流量上限，已用流量走原有逻辑
-			includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
-			finalLimit = int64(*subscribeFile.TrafficLimit*1024*1024*1024) + externalTrafficLimit
-			if includeProbeTraffic && hasTrafficInfo {
-				finalUsed = totalUsed + externalTrafficUsed
+		} else if hasSubscribeFile {
+			if simLimit, simUsed, ok := resolveCustomSimulatedTraffic(subscribeFile, time.Now()); ok {
+				// 纯自定义流量：按创建→到期 天数百分比模拟已用
+				finalLimit = simLimit + externalTrafficLimit
+				finalUsed = simUsed + externalTrafficUsed
+				if finalUsed > finalLimit && finalLimit > 0 {
+					finalUsed = finalLimit
+				}
+				trafficSource = "custom_day_simulate"
+			} else if subscribeFile.TrafficLimit != nil {
+				// 有上限但未启用模拟（如 limit<=0），仍输出上限与探针/外部已用
+				includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+				finalLimit = trafficLimitBytes(subscribeFile.TrafficLimit) + externalTrafficLimit
+				if includeProbeTraffic && hasTrafficInfo {
+					finalUsed = totalUsed + externalTrafficUsed
+				} else {
+					finalUsed = externalTrafficUsed
+				}
+				trafficSource = "custom_limit_probe_used"
 			} else {
-				finalUsed = externalTrafficUsed
+				// 仅过期时间 / 探针 / 外部
+				includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+				if includeProbeTraffic && hasTrafficInfo {
+					finalLimit = totalLimit + externalTrafficLimit
+					finalUsed = totalUsed + externalTrafficUsed
+				} else {
+					finalLimit = externalTrafficLimit
+					finalUsed = externalTrafficUsed
+				}
+				if subscribeFile.ExpireAt != nil && finalLimit == 0 && finalUsed == 0 {
+					trafficSource = "expire_only"
+				}
 			}
 		} else {
 			// 原有逻辑
@@ -1084,7 +1126,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 
 		logger.Info("[Subscription] 外部订阅流量", "limit_bytes", externalTrafficLimit, "limit_gb", float64(externalTrafficLimit)/(1024*1024*1024), "used_bytes", externalTrafficUsed, "used_gb", float64(externalTrafficUsed)/(1024*1024*1024))
-		logger.Info("[Subscription] 总流量", "limit_bytes", finalLimit, "limit_gb", float64(finalLimit)/(1024*1024*1024), "used_bytes", finalUsed, "used_gb", float64(finalUsed)/(1024*1024*1024))
+		logger.Info("[Subscription] 总流量", "source", trafficSource, "limit_bytes", finalLimit, "limit_gb", float64(finalLimit)/(1024*1024*1024), "used_bytes", finalUsed, "used_gb", float64(finalUsed)/(1024*1024*1024))
 
 		var expireAt *time.Time
 		if hasSubscribeFile {
@@ -1092,7 +1134,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 		headerValue := buildSubscriptionHeader(finalLimit, finalUsed, expireAt)
 		w.Header().Set("subscription-userinfo", headerValue)
-		logger.Info("[Subscription] 设置订阅用户信息头", "header", headerValue)
+		logger.Info("[Subscription] 设置订阅用户信息头", "source", trafficSource, "header", headerValue)
 	}
 	w.Header().Set("profile-update-interval", "24")
 	// 只有非浏览器访问时才添加 content-disposition 头（避免浏览器直接下载）
