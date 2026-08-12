@@ -561,10 +561,14 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 			existing.TrafficLimit = nil
 			existing.TrafficStartAt = nil
 		} else if existing.TrafficStartAt == nil {
-			// First enable of custom traffic: cycle starts now (remaining-day model).
-			now := time.Now().UTC()
-			existing.TrafficStartAt = &now
+			// First enable: if expire is set, start = expire - 30d (or now if later);
+			// otherwise start now. Avoids "7 days left → used≈0" when start was set to now.
+			ensureTrafficStartAt(&existing, time.Now().UTC())
 		}
+	}
+	// Expire changed while custom traffic is on: if start is missing, derive it.
+	if req.ExpireAt != nil && existing.TrafficLimit != nil && *existing.TrafficLimit > 0 && existing.TrafficStartAt == nil {
+		ensureTrafficStartAt(&existing, time.Now().UTC())
 	}
 	if req.StatsServerIDs != nil {
 		existing.StatsServerIDs = *req.StatsServerIDs

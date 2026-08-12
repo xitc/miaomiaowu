@@ -9,11 +9,32 @@ import (
 
 const bytesPerGB = int64(1024 * 1024 * 1024)
 
+// defaultCustomTrafficCycleDays is used when first enabling custom traffic with an
+// expire date: billing start defaults to expire - N days (clamped not after now),
+// so a sub with only a few days left shows most quota already consumed instead of ~0 used.
+const defaultCustomTrafficCycleDays = 30
+
+// defaultTrafficStartForExpire returns a billing-cycle start for an existing expire.
+// start = expire - defaultCustomTrafficCycleDays; if that is still in the future, use now
+// (new long-lived sub: burn across the full remaining window from now).
+func defaultTrafficStartForExpire(expire, now time.Time) time.Time {
+	expire = expire.UTC()
+	now = now.UTC()
+	start := expire.Add(-time.Duration(defaultCustomTrafficCycleDays) * 24 * time.Hour)
+	if start.After(now) {
+		return now
+	}
+	return start
+}
+
 // customTrafficPeriodStart picks the billing-cycle start for remaining-time simulation.
-// Prefer TrafficStartAt (set when custom traffic is enabled); fall back to CreatedAt.
-func customTrafficPeriodStart(file storage.SubscribeFile) time.Time {
+// Prefer TrafficStartAt; else if expire is set, derive from default cycle; else CreatedAt.
+func customTrafficPeriodStart(file storage.SubscribeFile, now time.Time) time.Time {
 	if file.TrafficStartAt != nil && !file.TrafficStartAt.IsZero() {
 		return file.TrafficStartAt.UTC()
+	}
+	if file.ExpireAt != nil && !file.ExpireAt.IsZero() {
+		return defaultTrafficStartForExpire(*file.ExpireAt, now)
 	}
 	if !file.CreatedAt.IsZero() {
 		return file.CreatedAt.UTC()
@@ -25,9 +46,6 @@ func customTrafficPeriodStart(file storage.SubscribeFile) time.Time {
 //
 //	remaining = total * (expire - now) / (expire - start)
 //	used      = total - remaining
-//
-// This is continuous (not whole-day buckets), so usage grows within the first day
-// instead of staying at 0 until a full calendar day elapses.
 //
 // Rules:
 //   - totalBytes <= 0 → 0
@@ -50,7 +68,6 @@ func simulateTrafficUsedByRemainingTime(totalBytes int64, start, expire time.Tim
 		return totalBytes
 	}
 	if start.IsZero() {
-		// Without a start we cannot form a period; keep full remaining until expire.
 		return 0
 	}
 	if now.Before(start) {
@@ -108,8 +125,9 @@ func usesCustomTrafficSimulation(file storage.SubscribeFile) bool {
 	return file.TrafficLimit != nil && *file.TrafficLimit > 0 && file.StatsServerIDs == ""
 }
 
-// ensureTrafficStartAt sets TrafficStartAt to now when enabling custom traffic without a start.
-// Returns true if the file was modified and should be persisted.
+// ensureTrafficStartAt sets TrafficStartAt when enabling custom traffic without a start.
+// With expire: start = expire - 30d (or now if that is in the future).
+// Without expire: start = now.
 func ensureTrafficStartAt(file *storage.SubscribeFile, now time.Time) bool {
 	if file == nil || !usesCustomTrafficSimulation(*file) {
 		return false
@@ -117,13 +135,18 @@ func ensureTrafficStartAt(file *storage.SubscribeFile, now time.Time) bool {
 	if file.TrafficStartAt != nil && !file.TrafficStartAt.IsZero() {
 		return false
 	}
-	t := now.UTC()
-	file.TrafficStartAt = &t
+	now = now.UTC()
+	var start time.Time
+	if file.ExpireAt != nil && !file.ExpireAt.IsZero() {
+		start = defaultTrafficStartForExpire(*file.ExpireAt, now)
+	} else {
+		start = now
+	}
+	file.TrafficStartAt = &start
 	return true
 }
 
 // resolveCustomSimulatedTraffic returns limit/used for pure custom remaining-time simulation.
-// ok is true when the file has a custom traffic_limit suitable for simulation.
 func resolveCustomSimulatedTraffic(file storage.SubscribeFile, now time.Time) (limit, used int64, ok bool) {
 	if !usesCustomTrafficSimulation(file) {
 		return 0, 0, false
@@ -132,7 +155,8 @@ func resolveCustomSimulatedTraffic(file storage.SubscribeFile, now time.Time) (l
 	if limit <= 0 {
 		return 0, 0, false
 	}
-	start := customTrafficPeriodStart(file)
+	now = now.UTC()
+	start := customTrafficPeriodStart(file, now)
 	var expire time.Time
 	if file.ExpireAt != nil {
 		expire = file.ExpireAt.UTC()

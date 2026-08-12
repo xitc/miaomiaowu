@@ -3729,7 +3729,7 @@ const handleUpload = () => {
                                 className='h-8 text-sm'
                               />
                               <p className='text-[11px] text-muted-foreground leading-snug'>
-                                仅填自定义流量、不选统计服务器时：按「剩余时间 / 总周期」比例折算已用与剩余（启用时起算到到期，连续扣减），并写入 subscription-userinfo。
+                                自定义流量（无探针时）：默认按 30 天周期回推起点（起点=到期−30天），再按剩余时间比例扣减。剩余越少已用越高。
                               </p>
                             </div>
                             <div className='space-y-1'>
@@ -5847,8 +5847,7 @@ const handleUpload = () => {
                 placeholder='例如 500；留空则跟随探针'
               />
               <p className='text-xs text-muted-foreground'>
-                填写后作为订阅 total 流量。不选统计服务器时，按剩余时间比例连续折算已用（周期从启用自定义流量起算到到期，到期用完）。
-                仅有到期、未填流量时也会下发 expire。
+                填写后作为订阅 total。无探针时按剩余时间比例扣减：默认周期 30 天（起点≈到期−30天）；临近到期则已用偏高、剩余偏低。仅有到期未填流量时也会下发 expire。
               </p>
             </div>
             <div className='space-y-2'>

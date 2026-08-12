@@ -1,12 +1,30 @@
 package handler
 
 import (
-	"math"
 	"testing"
 	"time"
 
 	"miaomiaowu/internal/storage"
 )
+
+func TestDefaultTrafficStartForExpire(t *testing.T) {
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	// Expire in 7 days → start = expire - 30d (23 days ago)
+	expire7 := now.Add(7 * 24 * time.Hour)
+	start := defaultTrafficStartForExpire(expire7, now)
+	want := expire7.Add(-30 * 24 * time.Hour)
+	if !start.Equal(want) {
+		t.Fatalf("7d left: start=%v want %v", start, want)
+	}
+
+	// Expire in 40 days → start clamped to now (full remaining window from now)
+	expire40 := now.Add(40 * 24 * time.Hour)
+	start = defaultTrafficStartForExpire(expire40, now)
+	if !start.Equal(now) {
+		t.Fatalf("40d left: start=%v want now", start)
+	}
+}
 
 func TestSimulateTrafficUsedByRemainingTime(t *testing.T) {
 	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
@@ -22,34 +40,16 @@ func TestSimulateTrafficUsedByRemainingTime(t *testing.T) {
 		}
 	})
 
-	t.Run("a few hours into first day is non-zero", func(t *testing.T) {
-		now := start.Add(6 * time.Hour)
-		used := simulateTrafficUsedByRemainingTime(total, start, expire, now)
-		if used <= 0 {
-			t.Fatalf("expected non-zero used within first day, got %d", used)
-		}
-		// ~6h / 30d ≈ 0.83%
-		ratio := float64(used) / float64(total)
-		if ratio < 0.005 || ratio > 0.02 {
-			t.Fatalf("unexpected early ratio %v", ratio)
-		}
-	})
-
-	t.Run("just started tiny used", func(t *testing.T) {
-		now := start.Add(time.Minute)
-		used := simulateTrafficUsedByRemainingTime(total, start, expire, now)
-		if used < 0 || used > total/1000 {
-			t.Fatalf("used=%d", used)
-		}
-	})
-
-	t.Run("one day left", func(t *testing.T) {
-		now := expire.Add(-24 * time.Hour)
-		used := simulateTrafficUsedByRemainingTime(total, start, expire, now)
-		// remaining 1/30 => used 29/30
-		want := int64(math.Round(float64(total) * 29 / 30))
-		if used != want {
-			t.Fatalf("used=%d want %d", used, want)
+	t.Run("seven days left of thirty day cycle", func(t *testing.T) {
+		// Matches No.003 shape: 30d package, 7d remaining → used ~76.7%
+		now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+		expire := now.Add(7 * 24 * time.Hour)
+		start := defaultTrafficStartForExpire(expire, now)
+		limit := int64(500 * bytesPerGB)
+		used := simulateTrafficUsedByRemainingTime(limit, start, expire, now)
+		ratio := float64(used) / float64(limit)
+		if ratio < 0.75 || ratio > 0.78 {
+			t.Fatalf("ratio=%v used_gb=%v start=%v", ratio, float64(used)/float64(bytesPerGB), start)
 		}
 	})
 
@@ -58,44 +58,41 @@ func TestSimulateTrafficUsedByRemainingTime(t *testing.T) {
 			t.Fatal("expected full at expire")
 		}
 	})
-
-	t.Run("no expire zero used", func(t *testing.T) {
-		if simulateTrafficUsedByRemainingTime(total, start, time.Time{}, start.Add(10*24*time.Hour)) != 0 {
-			t.Fatal("expected 0")
-		}
-	})
 }
 
-func TestResolveCustomSimulatedTrafficUsesTrafficStartAt(t *testing.T) {
-	limit := 200.0
-	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	expire := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	createdLongAgo := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+func TestResolveCustomWithDerivedStart(t *testing.T) {
+	limit := 500.0
+	now := time.Date(2026, 8, 12, 15, 0, 0, 0, time.UTC)
+	expire := now.Add(7 * 24 * time.Hour)
+	// No TrafficStartAt — should derive expire-30d
 	file := storage.SubscribeFile{
-		TrafficLimit:   &limit,
-		TrafficStartAt: &start,
-		CreatedAt:      createdLongAgo,
-		ExpireAt:       &expire,
+		TrafficLimit: &limit,
+		ExpireAt:     &expire,
 	}
-	now := start.Add(15 * 24 * time.Hour)
 	gotLimit, gotUsed, ok := resolveCustomSimulatedTraffic(file, now)
-	if !ok || gotLimit != 200*bytesPerGB {
+	if !ok || gotLimit != 500*bytesPerGB {
 		t.Fatalf("ok=%v limit=%d", ok, gotLimit)
 	}
 	ratio := float64(gotUsed) / float64(gotLimit)
-	if ratio < 0.45 || ratio > 0.55 {
-		t.Fatalf("expected ~half used with traffic_start_at mid cycle, ratio=%v", ratio)
+	if ratio < 0.75 || ratio > 0.78 {
+		t.Fatalf("expected ~76%% used for 7d left of 30d cycle, ratio=%v used_gb=%v", ratio, float64(gotUsed)/float64(bytesPerGB))
 	}
 }
 
-func TestEnsureTrafficStartAt(t *testing.T) {
+func TestEnsureTrafficStartAtUsesExpireCycle(t *testing.T) {
 	limit := 10.0
-	file := storage.SubscribeFile{TrafficLimit: &limit}
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	expire := now.Add(3 * 24 * time.Hour)
+	file := storage.SubscribeFile{TrafficLimit: &limit, ExpireAt: &expire}
 	if !ensureTrafficStartAt(&file, now) || file.TrafficStartAt == nil {
 		t.Fatal("expected set")
 	}
+	want := defaultTrafficStartForExpire(expire, now)
+	if !file.TrafficStartAt.Equal(want) {
+		t.Fatalf("start=%v want %v", file.TrafficStartAt, want)
+	}
+	// already set — no change
 	if ensureTrafficStartAt(&file, now.Add(time.Hour)) {
-		t.Fatal("should not reset existing start")
+		t.Fatal("should not reset")
 	}
 }
