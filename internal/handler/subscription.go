@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
@@ -545,67 +546,44 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 					logger.Info("[Subscription] 强制同步已启用，将同步引用的外部订阅", "sync_count", len(subsToSync), "total_count", len(allExternalSubs))
 
-					// Check if we need to sync based on cache expiration
-					shouldSync := false
-					if settings.CacheExpireMinutes > 0 {
-						// Check last sync time only for referenced subscriptions
-						for _, sub := range subsToSync {
-							if sub.LastSyncAt == nil {
-								// Never synced before
-								logger.Info("[Subscription] 订阅从未同步过，将进行同步", "name", sub.Name, "url", sub.URL)
-								shouldSync = true
-								break
-							}
-
-							// Calculate time difference in minutes
-							elapsed := time.Since(*sub.LastSyncAt).Minutes()
-							if elapsed >= float64(settings.CacheExpireMinutes) {
-								// Cache expired
-								logger.Info("[Subscription] 订阅缓存已过期，将进行同步", "name", sub.Name, "url", sub.URL, "elapsed_minutes", elapsed, "expire_minutes", settings.CacheExpireMinutes)
-								shouldSync = true
-								break
-							}
-						}
-						if !shouldSync {
-							logger.Info("[Subscription] All referenced subscriptions are within cache time, skipping sync")
-						}
+					// Only the expired / never-synced refs need work (not every referenced sub).
+					expiredSubs := filterExternalSubsNeedingSync(subsToSync, settings.CacheExpireMinutes)
+					if len(expiredSubs) == 0 {
+						logger.Info("[Subscription] All referenced subscriptions are within cache time, skipping sync")
 					} else {
-						// Cache expire minutes is 0, always sync
-						logger.Info("[Subscription] Cache expire minutes is 0, will always sync referenced subscriptions")
-						shouldSync = true
-					}
-
-					if shouldSync {
-						logger.Info("[Subscription] 开始同步用户的外部订阅(仅引用的订阅)", "user", username)
-						// Sync only the referenced external subscriptions
-						if err := syncReferencedExternalSubscriptions(r.Context(), h.repo, h.baseDir, username, subsToSync); err != nil {
-							logger.Info("[Subscription] 同步外部订阅失败", "error", err)
-							// Log error but don't fail the request
-							// The sync is best-effort
-						} else {
-							logger.Info("[Subscription] External subscriptions sync completed successfully")
-
-							// Preserve the requested output mode after sync. Template-backed
-							// responses must be regenerated from the same mode-specific
-							// template; reading resolvedPath here would replace Provider output
-							// with the normal on-disk subscription YAML.
-							updatedData, err := refreshSubscriptionDataAfterExternalSync(
-								fromTemplate,
-								func() ([]byte, error) {
-									if fromSelectedTags {
-										return h.generateFromSelectedTags(r.Context(), username, subscribeFile)
-									}
-									return h.generateFromTemplate(r.Context(), username, fileForTemplate, outputMode, r)
-								},
-								func() ([]byte, error) {
-									return os.ReadFile(resolvedPath)
-								},
-							)
-							if err != nil {
-								logger.Info("[Subscription] 同步后刷新订阅输出失败", "mode", outputMode, "from_template", fromTemplate, "error", err)
+						// Stale-while-revalidate:
+						// - Provider mode never blocks (response is URL shell; clients pull providers themselves).
+						// - Normal mode blocks only for never-synced refs (no nodes yet); expired cache refreshes in background.
+						blockingSubs, backgroundSubs := splitExternalSyncUrgency(expiredSubs, outputMode)
+						if len(backgroundSubs) > 0 {
+							scheduleBackgroundReferencedExternalSync(h.repo, h.baseDir, username, backgroundSubs)
+							logger.Info("[Subscription] 缓存过期：后台刷新外部订阅，先返回当前订阅",
+								"user", username, "background_count", len(backgroundSubs), "mode", outputMode)
+						}
+						if len(blockingSubs) > 0 {
+							logger.Info("[Subscription] 开始同步用户的外部订阅(阻塞，首次/必要)", "user", username, "count", len(blockingSubs))
+							if err := syncReferencedExternalSubscriptions(r.Context(), h.repo, h.baseDir, username, blockingSubs); err != nil {
+								logger.Info("[Subscription] 同步外部订阅失败", "error", err)
 							} else {
-								data = updatedData
-								logger.Info("[Subscription] 同步后刷新订阅输出成功", "mode", outputMode, "from_template", fromTemplate, "bytes", len(data))
+								logger.Info("[Subscription] External subscriptions sync completed successfully")
+								updatedData, err := refreshSubscriptionDataAfterExternalSync(
+									fromTemplate,
+									func() ([]byte, error) {
+										if fromSelectedTags {
+											return h.generateFromSelectedTags(r.Context(), username, subscribeFile)
+										}
+										return h.generateFromTemplate(r.Context(), username, fileForTemplate, outputMode, r)
+									},
+									func() ([]byte, error) {
+										return os.ReadFile(resolvedPath)
+									},
+								)
+								if err != nil {
+									logger.Info("[Subscription] 同步后刷新订阅输出失败", "mode", outputMode, "from_template", fromTemplate, "error", err)
+								} else {
+									data = updatedData
+									logger.Info("[Subscription] 同步后刷新订阅输出成功", "mode", outputMode, "from_template", fromTemplate, "bytes", len(data))
+								}
 							}
 						}
 					}
@@ -1394,7 +1372,97 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 	return usedURLs, nil
 }
 
-// syncReferencedExternalSubscriptions syncs only the specified external subscriptions
+// filterExternalSubsNeedingSync returns only subscriptions past the cache window
+// (or never synced). cacheExpireMinutes <= 0 means always sync every input.
+func filterExternalSubsNeedingSync(subs []storage.ExternalSubscription, cacheExpireMinutes int) []storage.ExternalSubscription {
+	if len(subs) == 0 {
+		return nil
+	}
+	if cacheExpireMinutes <= 0 {
+		out := make([]storage.ExternalSubscription, len(subs))
+		copy(out, subs)
+		return out
+	}
+	out := make([]storage.ExternalSubscription, 0, len(subs))
+	for _, sub := range subs {
+		if sub.LastSyncAt == nil {
+			logger.Info("[Subscription] 订阅从未同步过，将进行同步", "name", sub.Name, "url", sub.URL)
+			out = append(out, sub)
+			continue
+		}
+		elapsed := time.Since(*sub.LastSyncAt).Minutes()
+		if elapsed >= float64(cacheExpireMinutes) {
+			logger.Info("[Subscription] 订阅缓存已过期，将进行同步", "name", sub.Name, "url", sub.URL, "elapsed_minutes", elapsed, "expire_minutes", cacheExpireMinutes)
+			out = append(out, sub)
+		}
+	}
+	return out
+}
+
+// splitExternalSyncUrgency separates first-time (blocking) syncs from expired-cache
+// refreshes that can run in the background. Provider mode never blocks.
+func splitExternalSyncUrgency(subs []storage.ExternalSubscription, outputMode string) (blocking, background []storage.ExternalSubscription) {
+	if len(subs) == 0 {
+		return nil, nil
+	}
+	// Provider 输出只注入 proxy-provider URL，客户端自行拉取；订阅接口无需等节点池刷新。
+	if storage.NormalizeDefaultOutputMode(outputMode) == storage.OutputModeProvider {
+		return nil, subs
+	}
+	for _, sub := range subs {
+		if sub.LastSyncAt == nil {
+			blocking = append(blocking, sub)
+		} else {
+			background = append(background, sub)
+		}
+	}
+	return blocking, background
+}
+
+var backgroundReferencedSync = struct {
+	mu      sync.Mutex
+	running map[string]bool
+}{running: map[string]bool{}}
+
+// scheduleBackgroundReferencedExternalSync refreshes expired external subscriptions
+// without blocking the subscription HTTP response (stale-while-revalidate).
+func scheduleBackgroundReferencedExternalSync(repo *storage.TrafficRepository, subscribeDir, username string, subs []storage.ExternalSubscription) {
+	if repo == nil || username == "" || len(subs) == 0 {
+		return
+	}
+	// Deduplicate concurrent schedule for the same user.
+	backgroundReferencedSync.mu.Lock()
+	if backgroundReferencedSync.running[username] {
+		backgroundReferencedSync.mu.Unlock()
+		logger.Info("[Subscription] 后台外部订阅同步已在运行，跳过重复调度", "user", username)
+		return
+	}
+	backgroundReferencedSync.running[username] = true
+	backgroundReferencedSync.mu.Unlock()
+
+	// Copy slice for the goroutine.
+	subsCopy := make([]storage.ExternalSubscription, len(subs))
+	copy(subsCopy, subs)
+
+	go func() {
+		defer func() {
+			backgroundReferencedSync.mu.Lock()
+			delete(backgroundReferencedSync.running, username)
+			backgroundReferencedSync.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		start := time.Now()
+		if err := syncReferencedExternalSubscriptions(ctx, repo, subscribeDir, username, subsCopy); err != nil {
+			logger.Info("[Subscription] 后台外部订阅同步失败", "user", username, "error", err, "duration_ms", time.Since(start).Milliseconds())
+			return
+		}
+		logger.Info("[Subscription] 后台外部订阅同步完成", "user", username, "count", len(subsCopy), "duration_ms", time.Since(start).Milliseconds())
+	}()
+}
+
+// syncReferencedExternalSubscriptions syncs only the specified external subscriptions.
+// Multiple subscriptions are synced in parallel (bounded) to cut multi-source latency.
 func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string, subsToSync []storage.ExternalSubscription) error {
 	if repo == nil || username == "" || len(subsToSync) == 0 {
 		return fmt.Errorf("invalid parameters")
@@ -1412,40 +1480,49 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 	logger.Info("[Subscription] 用户需要同步的外部订阅", "user", username, "count", len(subsToSync), "match_rule", userSettings.MatchRule)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := newSSRFSafeHTTPClient(20 * time.Second)
 
-	// Track total nodes synced
+	const maxParallel = 3
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	totalNodesSynced := 0
 
 	for _, sub := range subsToSync {
-		subSyncStart := time.Now()
-		nodeCount, updatedSub, err := syncSingleExternalSubscription(ctx, client, repo, subscribeDir, username, sub, userSettings)
-		if err != nil {
-			logger.Info("[⏱️ 耗时监测] 同步订阅失败", "name", sub.Name, "url", sub.URL, "error", err, "duration_ms", time.Since(subSyncStart).Milliseconds())
-			continue
-		}
+		sub := sub
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
 
-		totalNodesSynced += nodeCount
+			subSyncStart := time.Now()
+			nodeCount, updatedSub, err := syncSingleExternalSubscription(ctx, client, repo, subscribeDir, username, sub, userSettings)
+			if err != nil {
+				logger.Info("[⏱️ 耗时监测] 同步订阅失败", "name", sub.Name, "url", sub.URL, "error", err, "duration_ms", time.Since(subSyncStart).Milliseconds())
+				return
+			}
 
-		// Update last sync time and node count
-		// Use updatedSub which contains traffic info from parseAndUpdateTrafficInfo
-		now := time.Now()
-		updatedSub.LastSyncAt = &now
-		updatedSub.NodeCount = nodeCount
-		if err := repo.UpdateExternalSubscription(ctx, updatedSub); err != nil {
-			logger.Info("[Subscription] 更新订阅同步时间失败", "name", sub.Name, "error", err)
-		}
-		logger.Info("[⏱️ 耗时监测] 外部订阅同步完成", "name", sub.Name, "node_count", nodeCount, "duration_ms", time.Since(subSyncStart).Milliseconds())
+			now := time.Now()
+			updatedSub.LastSyncAt = &now
+			updatedSub.NodeCount = nodeCount
+			if err := repo.UpdateExternalSubscription(ctx, updatedSub); err != nil {
+				logger.Info("[Subscription] 更新订阅同步时间失败", "name", sub.Name, "error", err)
+			}
+			logger.Info("[⏱️ 耗时监测] 外部订阅同步完成", "name", sub.Name, "node_count", nodeCount, "duration_ms", time.Since(subSyncStart).Milliseconds())
+
+			mu.Lock()
+			totalNodesSynced += nodeCount
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 
 	logger.Info("[Subscription] 同步完成", "total_nodes", totalNodesSynced, "subscription_count", len(subsToSync))
-
-	// syncSingleExternalSubscription has already primed the shared content cache
-	// with the freshly downloaded payload and rebuilt each derived provider cache.
-	// Keep those entries: deleting them here would discard fresh work and force the
-	// next provider request to download the same upstream subscription again.
 	logger.Info("[Subscription] 保留同步生成的新缓存", "subscription_count", len(subsToSync))
 
 	return nil
