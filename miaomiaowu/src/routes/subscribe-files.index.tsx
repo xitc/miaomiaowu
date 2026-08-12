@@ -3700,7 +3700,7 @@ const handleUpload = () => {
                               </div>
                               {isSimulated && (
                                 <div className='text-xs text-muted-foreground'>
-                                  按剩余天数折算（启用日起 → 到期）
+                                  按剩余时间比例折算（启用日起 → 到期）
                                 </div>
                               )}
                               {!isCustom && <div className='text-xs text-muted-foreground'>点击可设置独立流量</div>}
@@ -3729,7 +3729,7 @@ const handleUpload = () => {
                                 className='h-8 text-sm'
                               />
                               <p className='text-[11px] text-muted-foreground leading-snug'>
-                                仅填自定义流量、不选统计服务器时：按「剩余天数 / 总天数」折算剩余流量（启用时起算到到期），并写入 subscription-userinfo。
+                                仅填自定义流量、不选统计服务器时：按「剩余时间 / 总周期」比例折算已用与剩余（启用时起算到到期，连续扣减），并写入 subscription-userinfo。
                               </p>
                             </div>
                             <div className='space-y-1'>
@@ -5847,7 +5847,7 @@ const handleUpload = () => {
                 placeholder='例如 500；留空则跟随探针'
               />
               <p className='text-xs text-muted-foreground'>
-                填写后作为订阅 total 流量。不选统计服务器时，按「剩余天数 / 周期总天数」折算剩余与已用（周期从启用自定义流量起算到到期，到期用完）。
+                填写后作为订阅 total 流量。不选统计服务器时，按剩余时间比例连续折算已用（周期从启用自定义流量起算到到期，到期用完）。
                 仅有到期、未填流量时也会下发 expire。
               </p>
             </div>

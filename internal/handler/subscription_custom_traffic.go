@@ -9,51 +9,40 @@ import (
 
 const bytesPerGB = int64(1024 * 1024 * 1024)
 
-// calendarDaysCeil returns whole calendar days covering d, rounding partial days up.
-// Zero or negative duration yields 0.
-func calendarDaysCeil(d time.Duration) int {
-	if d <= 0 {
-		return 0
-	}
-	// 1ns .. 24h => 1 day
-	const day = 24 * time.Hour
-	days := int(d / day)
-	if d%day != 0 {
-		days++
-	}
-	return days
-}
-
-// customTrafficPeriodStart picks the billing-cycle start for remaining-day simulation.
+// customTrafficPeriodStart picks the billing-cycle start for remaining-time simulation.
 // Prefer TrafficStartAt (set when custom traffic is enabled); fall back to CreatedAt.
 func customTrafficPeriodStart(file storage.SubscribeFile) time.Time {
 	if file.TrafficStartAt != nil && !file.TrafficStartAt.IsZero() {
-		return *file.TrafficStartAt
+		return file.TrafficStartAt.UTC()
 	}
 	if !file.CreatedAt.IsZero() {
-		return file.CreatedAt
+		return file.CreatedAt.UTC()
 	}
-	return file.UpdatedAt
+	return file.UpdatedAt.UTC()
 }
 
-// simulateTrafficUsedByRemainingDays burns custom traffic by remaining calendar days:
+// simulateTrafficUsedByRemainingTime burns custom traffic by remaining time fraction:
 //
-//	remaining = total * remainingDays / totalDays
+//	remaining = total * (expire - now) / (expire - start)
 //	used      = total - remaining
 //
-// totalDays  = ceil((expire - start) / 1d)
-// remainingDays = ceil((expire - now) / 1d) while not expired
+// This is continuous (not whole-day buckets), so usage grows within the first day
+// instead of staying at 0 until a full calendar day elapses.
 //
 // Rules:
-//   - totalBytes <= 0        → 0
-//   - no expire              → 0 used (only expose quota)
-//   - now >= expire          → full totalBytes used
-//   - now <= start           → 0 used
-//   - invalid period         → 0
-func simulateTrafficUsedByRemainingDays(totalBytes int64, start, expire time.Time, now time.Time) int64 {
+//   - totalBytes <= 0 → 0
+//   - no expire       → 0 used (only expose quota)
+//   - now >= expire   → full totalBytes used
+//   - now <= start    → 0 used
+//   - invalid period  → 0
+func simulateTrafficUsedByRemainingTime(totalBytes int64, start, expire time.Time, now time.Time) int64 {
 	if totalBytes <= 0 {
 		return 0
 	}
+	start = start.UTC()
+	expire = expire.UTC()
+	now = now.UTC()
+
 	if expire.IsZero() {
 		return 0
 	}
@@ -67,23 +56,28 @@ func simulateTrafficUsedByRemainingDays(totalBytes int64, start, expire time.Tim
 	if now.Before(start) {
 		return 0
 	}
-	if !expire.After(start) {
+	period := expire.Sub(start)
+	if period <= 0 {
 		return totalBytes
 	}
 
-	totalDays := calendarDaysCeil(expire.Sub(start))
-	if totalDays <= 0 {
-		return 0
+	remainingDur := expire.Sub(now)
+	if remainingDur < 0 {
+		remainingDur = 0
 	}
-	remainingDays := calendarDaysCeil(expire.Sub(now))
-	if remainingDays < 0 {
-		remainingDays = 0
-	}
-	if remainingDays > totalDays {
-		remainingDays = totalDays
+	if remainingDur > period {
+		remainingDur = period
 	}
 
-	remaining := int64(math.Round(float64(totalBytes) * float64(remainingDays) / float64(totalDays)))
+	ratioRemaining := float64(remainingDur) / float64(period)
+	if ratioRemaining < 0 {
+		ratioRemaining = 0
+	}
+	if ratioRemaining > 1 {
+		ratioRemaining = 1
+	}
+
+	remaining := int64(math.Round(float64(totalBytes) * ratioRemaining))
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -108,7 +102,7 @@ func trafficLimitBytes(limitGB *float64) int64 {
 	return int64(math.Round(*limitGB * float64(bytesPerGB)))
 }
 
-// usesCustomTrafficSimulation reports whether this file should burn traffic by day %
+// usesCustomTrafficSimulation reports whether this file should burn traffic by time %
 // instead of probe/external used counters. Pure custom limit without stats servers.
 func usesCustomTrafficSimulation(file storage.SubscribeFile) bool {
 	return file.TrafficLimit != nil && *file.TrafficLimit > 0 && file.StatsServerIDs == ""
@@ -128,7 +122,7 @@ func ensureTrafficStartAt(file *storage.SubscribeFile, now time.Time) bool {
 	return true
 }
 
-// resolveCustomSimulatedTraffic returns limit/used for pure custom remaining-day simulation.
+// resolveCustomSimulatedTraffic returns limit/used for pure custom remaining-time simulation.
 // ok is true when the file has a custom traffic_limit suitable for simulation.
 func resolveCustomSimulatedTraffic(file storage.SubscribeFile, now time.Time) (limit, used int64, ok bool) {
 	if !usesCustomTrafficSimulation(file) {
@@ -141,8 +135,8 @@ func resolveCustomSimulatedTraffic(file storage.SubscribeFile, now time.Time) (l
 	start := customTrafficPeriodStart(file)
 	var expire time.Time
 	if file.ExpireAt != nil {
-		expire = *file.ExpireAt
+		expire = file.ExpireAt.UTC()
 	}
-	used = simulateTrafficUsedByRemainingDays(limit, start, expire, now)
+	used = simulateTrafficUsedByRemainingTime(limit, start, expire, now)
 	return limit, used, true
 }
