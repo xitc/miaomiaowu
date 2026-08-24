@@ -3,11 +3,34 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"miaomiaowu/internal/storage"
 )
+
+// mergeExternalSyncTags keeps node metadata owned by the user or by derived
+// Providers and also restores the source-subscription tag from the incoming
+// node. External sync updates transport fields; it must not replace labels.
+func mergeExternalSyncTags(existing, incoming []string) []string {
+	merged := make([]string, 0, len(existing)+len(incoming))
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, tags := range [][]string{existing, incoming} {
+		for _, tag := range tags {
+			tag = strings.TrimSpace(tag)
+			if tag == "" {
+				continue
+			}
+			if _, ok := seen[tag]; ok {
+				continue
+			}
+			seen[tag] = struct{}{}
+			merged = append(merged, tag)
+		}
+	}
+	return merged
+}
 
 // Singleflight for external subscription sync: key = username + "\x00" + subID.
 var (
@@ -152,6 +175,9 @@ func nodeSyncPayloadEqual(existing storage.Node, incoming storage.Node, keepNode
 		wantName = existing.NodeName
 	}
 	if existing.NodeName != wantName {
+		return false
+	}
+	if existing.Tag != incoming.Tag || !slices.Equal(existing.Tags, incoming.Tags) {
 		return false
 	}
 

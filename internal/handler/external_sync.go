@@ -636,8 +636,12 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 			candidate.ParsedConfig = node.ParsedConfig
 			candidate.ClashConfig = node.ClashConfig
 			candidate.Enabled = node.Enabled
-			// Preserve multi-tags; only refresh primary Tag from subscription name when empty.
-			if candidate.Tag == "" {
+			// Preserve user/Provider labels and ensure the source-subscription label
+			// remains present. Manual sync must never replace node metadata.
+			candidate.Tags = mergeExternalSyncTags(existingNode.Tags, node.Tags)
+			if len(candidate.Tags) > 0 {
+				candidate.Tag = candidate.Tags[0]
+			} else {
 				candidate.Tag = node.Tag
 			}
 

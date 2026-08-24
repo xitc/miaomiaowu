@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,6 +9,17 @@ import (
 
 	"miaomiaowu/internal/storage"
 )
+
+func TestMergeExternalSyncTagsPreservesLabelsAndRestoresSource(t *testing.T) {
+	got := mergeExternalSyncTags(
+		[]string{"自定义", "Provider/HK", "自定义"},
+		[]string{"provider-service", "Provider/HK"},
+	)
+	want := []string{"自定义", "Provider/HK", "provider-service"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged tags = %v, want %v", got, want)
+	}
+}
 
 func TestExternalSyncSingleflightSharesOneRun(t *testing.T) {
 	const callers = 16
@@ -84,6 +96,7 @@ func TestNodeSyncPayloadEqualDetectsMaterialChanges(t *testing.T) {
 		ClashConfig:  `{"name":"node","type":"ss","server":"a.example","port":443}`,
 		Enabled:      true,
 		Tag:          "source",
+		Tags:         []string{"source", "自定义"},
 	}
 	if !nodeSyncPayloadEqual(base, base, false) {
 		t.Fatal("identical payload should be equal")
@@ -102,5 +115,10 @@ func TestNodeSyncPayloadEqualDetectsMaterialChanges(t *testing.T) {
 	changed.ParsedConfig = `{"name":"node","type":"ss","server":"parsed-change.example","port":443}`
 	if nodeSyncPayloadEqual(base, changed, false) {
 		t.Fatal("parsed config change must not be treated as equal")
+	}
+	changed = base
+	changed.Tags = []string{"source"}
+	if nodeSyncPayloadEqual(base, changed, false) {
+		t.Fatal("tag change must not be skipped as an unchanged payload")
 	}
 }
