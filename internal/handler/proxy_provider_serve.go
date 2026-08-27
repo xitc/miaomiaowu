@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"miaomiaowu/internal/logger"
-	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -26,13 +25,6 @@ import (
 
 // GeoIP 缓存和 API 配置
 const ipInfoToken = "cddae164b36656"
-
-type geoIPResponse struct {
-	IP          string `json:"ip"`
-	CountryCode string `json:"country_code"`
-}
-
-var geoIPCache = sync.Map{} // map[string]string (ip -> countryCode)
 
 // 订阅内容缓存（5分钟过期）
 const subscriptionCacheTTL = 5 * time.Minute
@@ -63,54 +55,6 @@ func storeSubscriptionContentCache(url string, content []byte) {
 		content:   content,
 		fetchedAt: time.Now(),
 	})
-}
-
-// getGeoIPCountryCode 查询 IP 的国家代码
-func getGeoIPCountryCode(ipOrHost string) string {
-	if ipOrHost == "" {
-		return ""
-	}
-
-	// 如果是域名，先解析为 IP
-	ip := ipOrHost
-	if net.ParseIP(ipOrHost) == nil {
-		// 是域名，需要解析
-		ips, err := net.LookupIP(ipOrHost)
-		if err != nil || len(ips) == 0 {
-			logger.Info("[GeoIP] 域名解析失败", "domain", ipOrHost, "error", err)
-			return ""
-		}
-		ip = ips[0].String()
-	}
-
-	// 检查缓存
-	if cached, ok := geoIPCache.Load(ip); ok {
-		return cached.(string)
-	}
-
-	// 查询 API
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", ip, ipInfoToken))
-	if err != nil {
-		logger.Info("[GeoIP] IP查询失败", "ip", ip, "error", err)
-		// 缓存空结果避免重复查询
-		geoIPCache.Store(ip, "")
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var result geoIPResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		logger.Info("[GeoIP] 响应解析失败", "ip", ip, "error", err)
-		geoIPCache.Store(ip, "")
-		return ""
-	}
-
-	// 缓存结果
-	countryCode := strings.ToUpper(result.CountryCode)
-	geoIPCache.Store(ip, countryCode)
-	logger.Info("[GeoIP] IP地理位置查询成功", "ip", ip, "country", countryCode)
-	return countryCode
 }
 
 // NewProxyProviderServeHandler handles serving filtered proxies for "妙妙屋处理" mode

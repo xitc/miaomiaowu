@@ -65,8 +65,12 @@ func (n *Notifier) Send(ctx context.Context, event Event) error {
 	}
 
 	cfg := n.GetConfig()
+	if event.PlainText {
+		text := fmt.Sprintf("%s\n%s", event.Title, event.Message)
+		return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, text, "")
+	}
 	text := fmt.Sprintf("*%s*\n%s", event.Title, event.Message)
-	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, text)
+	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, text, "Markdown")
 }
 
 // SendTest sends a test message regardless of event type toggles.
@@ -75,5 +79,5 @@ func (n *Notifier) SendTest(ctx context.Context) error {
 	if cfg.BotToken == "" || cfg.ChatID == "" {
 		return fmt.Errorf("bot token or chat ID is empty")
 	}
-	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, "*测试通知*\n喵喵喵喵屋通知配置成功 ✓")
+	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, "*测试通知*\n喵喵喵喵屋通知配置成功 ✓", "Markdown")
 }

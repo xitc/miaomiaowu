@@ -9,20 +9,22 @@ import (
 	"time"
 )
 
-const telegramAPIBase = "https://api.telegram.org/bot"
+var telegramAPIBase = "https://api.telegram.org/bot"
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-func sendTelegram(ctx context.Context, botToken, chatID, text string) error {
+func sendTelegram(ctx context.Context, botToken, chatID, text, parseMode string) error {
 	if botToken == "" || chatID == "" {
 		return fmt.Errorf("bot token or chat ID is empty")
 	}
 
 	endpoint := telegramAPIBase + botToken + "/sendMessage"
 	params := url.Values{
-		"chat_id":    {chatID},
-		"text":       {text},
-		"parse_mode": {"Markdown"},
+		"chat_id": {chatID},
+		"text":    {text},
+	}
+	if parseMode != "" {
+		params.Set("parse_mode", parseMode)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)

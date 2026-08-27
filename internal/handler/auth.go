@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -37,30 +38,47 @@ type credentialsRequest struct {
 }
 
 // GetClientIP extracts the client IP address from the request.
-// 优先级: CF-Connecting-IP > X-Forwarded-For[0] > X-Real-IP > RemoteAddr
+// 仅当直接上游是回环或私网反向代理时信任其覆写的 X-Real-IP；直连请求
+// 一律使用 RemoteAddr，避免客户端伪造 CF-Connecting-IP/X-Forwarded-For。
 func GetClientIP(r *http.Request) string {
-	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
-		return cf
-	}
+	remoteIP := parseRequestIP(r.RemoteAddr)
+	if isTrustedReverseProxy(remoteIP) {
+		if realIP := parseRequestIP(r.Header.Get("X-Real-IP")); realIP != "" {
+			return realIP
+		}
 
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
+		// Nginx 的 $proxy_add_x_forwarded_for 会把直接客户端追加在最右侧。
+		// 只取最右侧有效地址，不能信任客户端自行提供的最左侧值。
+		forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		for i := len(forwarded) - 1; i >= 0; i-- {
+			if ip := parseRequestIP(forwarded[i]); ip != "" {
+				return ip
+			}
 		}
 	}
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+	return remoteIP
+}
+
+func parseRequestIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
 	}
 
-	// Fall back to RemoteAddr
-	ip := r.RemoteAddr
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		ip = ip[:idx]
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
 	}
-	return ip
+	value = strings.Trim(value, "[]")
+	if parsed := net.ParseIP(value); parsed != nil {
+		return parsed.String()
+	}
+	return ""
+}
+
+func isTrustedReverseProxy(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && (parsed.IsLoopback() || parsed.IsPrivate())
 }
 
 func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, rateLimiter *LoginRateLimiter, twoFactorStore *auth.TwoFactorPendingStore, turnstile ...*captcha.Turnstile) http.Handler {

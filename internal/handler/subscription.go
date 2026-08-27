@@ -19,7 +19,6 @@ import (
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowu/internal/auth"
-	"miaomiaowu/internal/notify"
 	"miaomiaowu/internal/scriptengine"
 	"miaomiaowu/internal/storage"
 
@@ -402,6 +401,13 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			"duration_ms", time.Since(requestStart).Milliseconds(),
 		)
 		clientIP := GetClientIP(r)
+		queueSubscriptionFetchNotification(subscriptionFetchNotice{
+			Username:     username,
+			Subscription: displayName,
+			ClientType:   resolveClientType(r),
+			UserAgent:    r.Header.Get("User-Agent"),
+			ClientIP:     clientIP,
+		})
 		if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
 			silentMgr.RecordSubscriptionAccessWithIP(username, clientIP)
 		}
@@ -1134,16 +1140,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		"duration_ms", time.Since(requestStart).Milliseconds(),
 	)
 
-	if n := GetNotifier(); n != nil {
-		go n.Send(context.Background(), notify.Event{
-			Type:    notify.EventSubscribeFetch,
-			Title:   "订阅获取",
-			Message: fmt.Sprintf("用户 `%s` 获取了订阅 `%s`\n客户端: %s", username, displayName, clientType),
-		})
-	}
-
 	// 更新静默模式活跃时间
 	clientIP := GetClientIP(r)
+	queueSubscriptionFetchNotification(subscriptionFetchNotice{
+		Username:     username,
+		Subscription: displayName,
+		ClientType:   clientType,
+		UserAgent:    userAgent,
+		ClientIP:     clientIP,
+	})
 	if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
 		silentMgr.RecordSubscriptionAccessWithIP(username, clientIP)
 	}

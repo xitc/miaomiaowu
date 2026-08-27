@@ -29,7 +29,8 @@ type Config struct {
 
 // Event holds data for a notification to be sent.
 type Event struct {
-	Type    EventType
-	Title   string
-	Message string
+	Type      EventType
+	Title     string
+	Message   string
+	PlainText bool // 用户可控内容使用纯文本，避免 Telegram Markdown 注入或解析失败
 }
