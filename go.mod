@@ -7,6 +7,7 @@ require (
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/lionsoul2014/ip2region/binding/golang v0.0.0-20260405140448-5244ebad081e
 	github.com/pquerna/otp v1.5.0
 	golang.org/x/crypto v0.43.0
 	gopkg.in/yaml.v3 v3.0.1

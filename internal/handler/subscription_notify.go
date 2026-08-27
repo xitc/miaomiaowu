@@ -92,6 +92,9 @@ func describeIPLocation(ctx context.Context, ipString string) string {
 	if ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return "内网"
 	}
+	if location, ok := lookupIP2RegionLocation(ip.String()); ok {
+		return location
+	}
 
 	info := lookupGeoIPInfo(ctx, ip.String())
 	location := info.Country
