@@ -94,6 +94,26 @@ func storeExternalSyncSelection(username string, candidates []externalSyncCandid
 	return sessionID, nil
 }
 
+func proxyNameFromAny(proxy any) (string, bool) {
+	proxyMap, ok := proxy.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	proxyName, ok := proxyMap["name"].(string)
+	return proxyName, ok
+}
+
+func shouldExcludeProxyByNodeName(proxy any, filterRegex *regexp.Regexp) bool {
+	if filterRegex == nil {
+		return false
+	}
+	proxyName, ok := proxyNameFromAny(proxy)
+	if !ok {
+		return false
+	}
+	return filterRegex.MatchString(proxyName)
+}
+
 func applyNodeNameFilterToProxies(proxies []any, filterRegex *regexp.Regexp, filterPattern string) ([]any, int) {
 	if filterRegex == nil || len(proxies) == 0 {
 		return proxies, 0
@@ -103,14 +123,12 @@ func applyNodeNameFilterToProxies(proxies []any, filterRegex *regexp.Regexp, fil
 	filteredCount := 0
 
 	for _, proxy := range proxies {
-		if proxyMap, ok := proxy.(map[string]any); ok {
-			if proxyName, ok := proxyMap["name"].(string); ok {
-				if filterRegex.MatchString(proxyName) {
-					filteredCount++
-					logger.Info("[外部订阅同步] 过滤节点", "name", proxyName, "pattern", filterPattern)
-					continue
-				}
+		if shouldExcludeProxyByNodeName(proxy, filterRegex) {
+			filteredCount++
+			if proxyName, ok := proxyNameFromAny(proxy); ok {
+				logger.Info("[外部订阅同步] 过滤节点", "name", proxyName, "pattern", filterPattern)
 			}
+			continue
 		}
 		filteredProxies = append(filteredProxies, proxy)
 	}

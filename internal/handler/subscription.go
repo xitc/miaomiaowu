@@ -2663,9 +2663,10 @@ func (h *SubscriptionHandler) providerNodeOwner(ctx context.Context, username st
 	return nodeOwner
 }
 
-// serveSubscriptionProvider writes the original upstream payload.
-// User node_name_filter is applied by Clash through the generated
-// proxy-providers exclude-filter, not by rewriting this gateway body.
+// serveSubscriptionProvider writes a response-local copy of the upstream
+// provider payload after applying the node-pool owner's node_name_filter.
+// The generated proxy-providers exclude-filter remains as a second client-side
+// protection. Shared external-subscription cache bytes are never mutated.
 func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r *http.Request, username string, subscribeFile storage.SubscribeFile) {
 	if !subscribeFile.ProviderLinkEnabled {
 		writeError(w, http.StatusNotFound, errors.New("not found"))
@@ -2703,12 +2704,34 @@ func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r
 		return
 	}
 
+	ownerSettings, settingsErr := h.repo.GetUserSettings(r.Context(), nodeOwner)
+	if settingsErr != nil {
+		logger.Info("[SubscriptionProvider] 读取节点池所有者过滤规则失败", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "error", settingsErr)
+		writeError(w, http.StatusInternalServerError, errors.New("node name filter unavailable"))
+		return
+	}
+
 	data, err := fetchSubscriptionContent(&sub)
 	if err != nil {
 		logger.Info("[SubscriptionProvider] 拉取上游 Provider 失败", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "error", err)
 		writeError(w, http.StatusBadGateway, errors.New("provider upstream unavailable"))
 		return
 	}
+
+	// Isolate from the shared subscription cache before any parse/filter work.
+	data = append([]byte(nil), data...)
+
+	filtered, removed, err := filterProviderSourceYAML(data, ownerSettings.NodeNameFilter)
+	if err != nil {
+		logger.Info("[SubscriptionProvider] 节点名称过滤失败", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "error", err)
+		if errors.Is(err, errInvalidNodeNameFilter) {
+			writeError(w, http.StatusInternalServerError, errors.New("invalid node name filter"))
+			return
+		}
+		writeError(w, http.StatusBadGateway, errors.New("provider source filter failed"))
+		return
+	}
+	data = filtered
 
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -2717,7 +2740,7 @@ func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r
 	if bfp := GetBruteForceProtector(); bfp != nil {
 		bfp.RecordSuccess(GetClientIP(r))
 	}
-	logger.Info("[SubscriptionProvider] Provider 访问成功", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "bytes", len(data))
+	logger.Info("[SubscriptionProvider] Provider 访问成功", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "bytes", len(data), "filtered_nodes", removed)
 }
 
 func (h *SubscriptionHandler) serveExpiredProviderResponse(w http.ResponseWriter) {
@@ -3120,6 +3143,11 @@ func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.Pr
 	}
 }
 
+var (
+	errInvalidNodeNameFilter     = errors.New("invalid node name filter")
+	errProviderSourceInvalidYAML = errors.New("invalid provider source yaml")
+)
+
 func usableNodeNameFilterPattern(pattern string) string {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
@@ -3129,6 +3157,90 @@ func usableNodeNameFilterPattern(pattern string) string {
 		return ""
 	}
 	return pattern
+}
+
+func nodeNameFilterRegex(pattern string) (*regexp.Regexp, error) {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if usableNodeNameFilterPattern(trimmed) == "" {
+		return nil, errInvalidNodeNameFilter
+	}
+	return regexp.Compile(trimmed)
+}
+
+func proxyYAMLNodeName(proxyNode *yaml.Node) (string, error) {
+	if proxyNode == nil || proxyNode.Kind != yaml.MappingNode {
+		return "", fmt.Errorf("%w: proxy entry is not a mapping", errProviderSourceInvalidYAML)
+	}
+	var proxyMap map[string]any
+	if err := proxyNode.Decode(&proxyMap); err != nil {
+		return "", fmt.Errorf("%w: decode proxy: %v", errProviderSourceInvalidYAML, err)
+	}
+	name, ok := proxyNameFromAny(proxyMap)
+	if !ok {
+		return "", fmt.Errorf("%w: proxy name missing or not a string", errProviderSourceInvalidYAML)
+	}
+	return name, nil
+}
+
+func filterClashProxiesNodeByName(proxiesNode *yaml.Node, filterRegex *regexp.Regexp) (*yaml.Node, int, error) {
+	if filterRegex == nil || proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
+		return proxiesNode, 0, nil
+	}
+	filtered := &yaml.Node{Kind: yaml.SequenceNode, Tag: proxiesNode.Tag, Style: proxiesNode.Style}
+	removed := 0
+	for _, proxyNode := range proxiesNode.Content {
+		name, err := proxyYAMLNodeName(proxyNode)
+		if err != nil {
+			return nil, 0, err
+		}
+		if filterRegex.MatchString(name) {
+			removed++
+			continue
+		}
+		filtered.Content = append(filtered.Content, proxyNode)
+	}
+	return filtered, removed, nil
+}
+
+// filterProviderSourceYAML applies node_name_filter to a Clash YAML proxies list.
+// It never mutates src. Empty rules leave proxies unchanged. Invalid regex and
+// unparseable YAML/structure return an error so unfiltered nodes are not served.
+func filterProviderSourceYAML(src []byte, nodeNameFilter string) ([]byte, int, error) {
+	re, err := nodeNameFilterRegex(nodeNameFilter)
+	if err != nil {
+		return nil, 0, err
+	}
+	if re == nil {
+		return append([]byte(nil), src...), 0, nil
+	}
+
+	srcCopy := append([]byte(nil), src...)
+	var root yaml.Node
+	if err := yaml.Unmarshal(srcCopy, &root); err != nil {
+		return nil, 0, fmt.Errorf("%w: %v", errProviderSourceInvalidYAML, err)
+	}
+	proxiesNode := findProxiesNode(&root)
+	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
+		return nil, 0, fmt.Errorf("%w: missing proxies list", errProviderSourceInvalidYAML)
+	}
+
+	filtered, removed, err := filterClashProxiesNodeByName(proxiesNode, re)
+	if err != nil {
+		return nil, 0, err
+	}
+	proxiesNode.Kind = yaml.SequenceNode
+	proxiesNode.Tag = filtered.Tag
+	proxiesNode.Style = filtered.Style
+	proxiesNode.Content = filtered.Content
+
+	out, err := MarshalYAMLWithIndent(&root)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: encode: %v", errProviderSourceInvalidYAML, err)
+	}
+	return out, removed, nil
 }
 
 // mergeProxyProviderExcludeFilter unions a provider exclude-filter with the

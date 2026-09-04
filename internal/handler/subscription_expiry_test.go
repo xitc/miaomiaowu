@@ -37,6 +37,9 @@ func TestSubscriptionExpiryControlsNormalAndProviderGateway(t *testing.T) {
 	if err := repo.CreateUser(ctx, username, "", "", "test-hash", storage.RoleAdmin, ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.UpsertUserSettings(ctx, storage.UserSettings{Username: username, NodeNameFilter: defaultNodeNameFilterPattern}); err != nil {
+		t.Fatal(err)
+	}
 	externalID, err := repo.CreateExternalSubscription(ctx, storage.ExternalSubscription{
 		Username: username,
 		Name:     "source",
