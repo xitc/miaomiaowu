@@ -57,3 +57,32 @@ func TestSplitExternalSyncUrgency(t *testing.T) {
 		t.Fatalf("normal bg=%v", bg)
 	}
 }
+
+func TestSelectedProviderMetadataKeepsExternalReferenceWhenOutputIsEmpty(t *testing.T) {
+	file := storage.SubscribeFile{SelectedTags: []string{"Provider/am"}}
+	configs := []storage.ProxyProviderConfig{
+		{ID: 38, Name: "am", ExternalSubscriptionID: 41, ProcessMode: "client"},
+		{ID: 39, Name: "all", ExternalSubscriptionID: 44, ProcessMode: "client"},
+	}
+	subs := []storage.ExternalSubscription{
+		{ID: 41, URL: "https://provider.example/am.yaml"},
+		{ID: 44, URL: "https://provider.example/all.yaml"},
+	}
+	got := selectedProviderExternalSubscriptionURLs(file, storage.OutputModeNormal, configs, subs)
+	if !got["https://provider.example/am.yaml"] || got["https://provider.example/all.yaml"] || len(got) != 1 {
+		t.Fatalf("unexpected selected Provider URLs: %v", got)
+	}
+}
+
+func TestProviderModeEmptySelectionReferencesAllClientProviders(t *testing.T) {
+	file := storage.SubscribeFile{}
+	configs := []storage.ProxyProviderConfig{
+		{Name: "client", ExternalSubscriptionID: 1, ProcessMode: "client"},
+		{Name: "mmw", ExternalSubscriptionID: 2, ProcessMode: "mmw"},
+	}
+	subs := []storage.ExternalSubscription{{ID: 1, URL: "client-url"}, {ID: 2, URL: "mmw-url"}}
+	got := selectedProviderExternalSubscriptionURLs(file, storage.OutputModeProvider, configs, subs)
+	if !got["client-url"] || got["mmw-url"] || len(got) != 1 {
+		t.Fatalf("unexpected default Provider URLs: %v", got)
+	}
+}

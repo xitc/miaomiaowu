@@ -218,6 +218,10 @@ func missingProviderNodes(nodes []storage.Node, sub storage.ExternalSubscription
 }
 
 func syncProviderNodeTags(ctx context.Context, repo *storage.TrafficRepository, sub storage.ExternalSubscription, config storage.ProxyProviderConfig, entry *CacheEntry, staleTags ...string) error {
+	return syncProviderNodeTagsWithCreate(ctx, repo, sub, config, entry, true, staleTags...)
+}
+
+func syncProviderNodeTagsWithCreate(ctx context.Context, repo *storage.TrafficRepository, sub storage.ExternalSubscription, config storage.ProxyProviderConfig, entry *CacheEntry, createMissing bool, staleTags ...string) error {
 	if repo == nil || entry == nil {
 		return nil
 	}
@@ -231,7 +235,10 @@ func syncProviderNodeTags(ctx context.Context, repo *storage.TrafficRepository, 
 	if err := repo.BatchUpdateNodesNoFetch(ctx, changed); err != nil {
 		return fmt.Errorf("batch update provider tags: %w", err)
 	}
-	missing := missingProviderNodes(nodes, sub, providerNodeTag(config), entry.Nodes)
+	var missing []storage.Node
+	if createMissing {
+		missing = missingProviderNodes(nodes, sub, providerNodeTag(config), entry.Nodes)
+	}
 	validMissing := make([]storage.Node, 0, len(missing))
 	for _, node := range missing {
 		if strings.TrimSpace(node.Protocol) == "" {
@@ -247,6 +254,29 @@ func syncProviderNodeTags(ctx context.Context, repo *storage.TrafficRepository, 
 	}
 	logger.Info("[代理集合标签] 已同步 Provider 节点标签", "provider", config.Name, "tag", providerNodeTag(config), "matched_nodes", entry.NodeCount, "updated_nodes", len(changed), "created_nodes", len(validMissing))
 	return nil
+}
+
+func addProviderTagToCandidates(candidates []externalSyncCandidate, sub storage.ExternalSubscription, config storage.ProxyProviderConfig, entry *CacheEntry) {
+	if entry == nil || len(candidates) == 0 {
+		return
+	}
+	names, endpoints := providerNodeIdentitySets(entry.Nodes)
+	tag := providerNodeTag(config)
+	for i := range candidates {
+		if candidates[i].node.RawURL != sub.URL {
+			continue
+		}
+		var proxy map[string]any
+		_ = json.Unmarshal([]byte(candidates[i].node.ClashConfig), &proxy)
+		identity := proxyIdentity(proxy)
+		if !names[candidates[i].node.NodeName] && !names[identity.name] && (identity.endpoint == "" || !endpoints[identity.endpoint]) {
+			continue
+		}
+		candidates[i].node.Tags = mergeExternalSyncTags(candidates[i].node.Tags, []string{tag})
+		if len(candidates[i].node.Tags) > 0 {
+			candidates[i].node.Tag = candidates[i].node.Tags[0]
+		}
+	}
 }
 
 func refreshAndSyncProviderNodeTags(ctx context.Context, repo *storage.TrafficRepository, sub storage.ExternalSubscription, config storage.ProxyProviderConfig, staleTags ...string) error {

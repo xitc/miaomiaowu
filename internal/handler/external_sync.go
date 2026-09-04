@@ -182,7 +182,7 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 		}
 
 		totalNodesSynced += nodeCount
-		result.UpdatedCount += nodeCount
+		result.UpdatedCount += nodeCount - len(candidates)
 		result.Candidates = append(result.Candidates, candidates...)
 
 		// Update last sync time and node count
@@ -625,6 +625,11 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 		}
 
 		matchIdx := matchIndex.find(matchRule, node.NodeName, newNodeClashConfig)
+		preserveCollisionName := false
+		if matchIdx < 0 && matchRule == "node_name" && nodeNameTakenOutsideSource(existingNodes, sub.URL, node.NodeName) {
+			matchIdx = matchIndex.findUniqueEndpoint(newNodeClashConfig)
+			preserveCollisionName = matchIdx >= 0
+		}
 		if matchIdx >= 0 {
 			existingNode := existingNodes[matchIdx]
 			oldNodeName := existingNode.NodeName
@@ -645,7 +650,7 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 				candidate.Tag = node.Tag
 			}
 
-			if !keepNodeName {
+			if !keepNodeName && !preserveCollisionName {
 				candidate.NodeName = node.NodeName
 			} else {
 				// Force clash/parsed name to retained node name
@@ -764,14 +769,17 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 				logger.Warn("[代理集合标签] 外部订阅同步后刷新标签失败", "provider", config.Name, "error", refreshErr)
 				continue
 			}
-			if err := syncProviderNodeTags(ctx, repo, sub, config, entry); err != nil {
+			if deferNewNodes {
+				addProviderTagToCandidates(candidates, sub, config, entry)
+			}
+			if err := syncProviderNodeTagsWithCreate(ctx, repo, sub, config, entry, !deferNewNodes); err != nil {
 				logger.Warn("[代理集合标签] 外部订阅同步后刷新标签失败", "provider", config.Name, "error", err)
 			}
 		}
 	}
 
 	// 清理该外部订阅中已不存在的节点（仅 syncScope=all），保证聚合订阅能随源节点减少而减少
-	if syncScope == "all" {
+	if shouldCleanupExternalSyncOrphans(syncScope, deferNewNodes) {
 		removedOrphans := 0
 		for _, existing := range existingNodes {
 			if existing.RawURL != sub.URL {
@@ -806,7 +814,10 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 	// 刷新绑定模板的订阅，使聚合/模板订阅及时反映节点变化
 	go RefreshAllTemplateSubscriptions(repo, username)
 
-	return syncedCount, sub, candidates, nil
+	// NodeCount describes the current remote payload after filtering. In manual
+	// selection mode, candidates are intentionally not persisted yet and must not
+	// make a valid remote subscription look empty.
+	return len(nodesToUpdate), sub, candidates, nil
 }
 
 // ParseTrafficInfoHeader parses subscription-userinfo header and returns traffic info
@@ -1069,7 +1080,7 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
 		"message": fmt.Sprintf("订阅 %s 同步成功", targetSub.Name), "node_count": nodeCount,
-		"updated_count": nodeCount, "session_id": sessionID, "new_nodes": candidates,
+		"updated_count": nodeCount - len(candidates), "session_id": sessionID, "new_nodes": candidates,
 	})
 }
 

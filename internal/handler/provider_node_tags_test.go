@@ -107,3 +107,24 @@ func TestMissingProviderNodesKeepsOverlappingNamesSourceLocal(t *testing.T) {
 		t.Fatalf("missing node lost source identity: %+v", missing[0])
 	}
 }
+
+func TestAddProviderTagToCandidatesCarriesMetadataIntoConfirmation(t *testing.T) {
+	sub := storage.ExternalSubscription{Name: "am", URL: "source-url"}
+	config := storage.ProxyProviderConfig{Name: "am"}
+	candidates := []externalSyncCandidate{{
+		Name: "node",
+		node: storage.Node{
+			RawURL:      "source-url",
+			NodeName:    "node",
+			ClashConfig: `{"name":"node","type":"ss","server":"node.example","port":443}`,
+			Tag:         "am",
+			Tags:        []string{"am"},
+		},
+	}}
+	entry := &CacheEntry{Nodes: []any{map[string]any{"name": "node", "type": "ss", "server": "node.example", "port": 443}}}
+
+	addProviderTagToCandidates(candidates, sub, config, entry)
+	if !hasTag(candidates[0].node.Tags, "Provider/am") {
+		t.Fatalf("candidate tags = %v, want Provider/am", candidates[0].node.Tags)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,7 +532,24 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			usedExternalSubs, err := GetExternalSubscriptionsFromFile(r.Context(), data, username, h.repo)
 			if err != nil {
 				logger.Info("[Subscription] 获取文件中的外部订阅失败", "error", err)
-			} else if len(usedExternalSubs) > 0 {
+			} else {
+				// A tag-generated subscription can be empty after a failed/manual sync,
+				// so its YAML no longer contains node URLs from which to infer the source.
+				// Preserve the configured Provider -> external-subscription relationship
+				// as an independent source of truth for cache-expiry refreshes.
+				if hasSubscribeFile {
+					configs, configErr := h.repo.ListProxyProviderConfigs(r.Context(), username)
+					allSubs, subsErr := h.repo.ListExternalSubscriptions(r.Context(), username)
+					if configErr != nil || subsErr != nil {
+						logger.Info("[Subscription] 从订阅配置补充 Provider 引用失败", "config_error", configErr, "subscription_error", subsErr)
+					} else {
+						for url := range selectedProviderExternalSubscriptionURLs(subscribeFile, outputMode, configs, allSubs) {
+							usedExternalSubs[url] = true
+						}
+					}
+				}
+			}
+			if err == nil && len(usedExternalSubs) > 0 {
 				logger.Info("[Subscription] 找到当前文件引用的外部订阅", "count", len(usedExternalSubs))
 
 				// Get user's external subscriptions to check cache and get URLs
@@ -594,7 +612,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 						}
 					}
 				}
-			} else {
+			} else if err == nil {
 				logger.Info("[Subscription] No external subscriptions referenced in current file, skipping sync")
 			}
 		}
@@ -1402,6 +1420,40 @@ func filterExternalSubsNeedingSync(subs []storage.ExternalSubscription, cacheExp
 		}
 	}
 	return out
+}
+
+func selectedProviderExternalSubscriptionURLs(file storage.SubscribeFile, outputMode string, configs []storage.ProxyProviderConfig, subs []storage.ExternalSubscription) map[string]bool {
+	selectedNames := make(map[string]bool)
+	for _, tag := range file.SelectedTags {
+		if name, ok := strings.CutPrefix(strings.TrimSpace(tag), providerNodeTagPrefix); ok && strings.TrimSpace(name) != "" {
+			selectedNames[strings.TrimSpace(name)] = true
+		}
+	}
+	providerMode := storage.NormalizeDefaultOutputMode(outputMode) == storage.OutputModeProvider
+	for _, name := range file.SelectedProviderNames {
+		if strings.TrimSpace(name) != "" {
+			selectedNames[strings.TrimSpace(name)] = true
+		}
+	}
+
+	subURLs := make(map[int64]string, len(subs))
+	for _, sub := range subs {
+		if strings.TrimSpace(sub.URL) != "" {
+			subURLs[sub.ID] = sub.URL
+		}
+	}
+	used := make(map[string]bool)
+	for _, config := range configs {
+		// An empty selection in Provider mode means all client Providers.
+		selected := selectedNames[config.Name] || (providerMode && len(file.SelectedProviderNames) == 0 && config.ProcessMode == "client")
+		if !selected {
+			continue
+		}
+		if url := subURLs[config.ExternalSubscriptionID]; url != "" {
+			used[url] = true
+		}
+	}
+	return used
 }
 
 // splitExternalSyncUrgency separates first-time (blocking) syncs from expired-cache
@@ -2611,6 +2663,9 @@ func (h *SubscriptionHandler) providerNodeOwner(ctx context.Context, username st
 	return nodeOwner
 }
 
+// serveSubscriptionProvider writes the original upstream payload.
+// User node_name_filter is applied by Clash through the generated
+// proxy-providers exclude-filter, not by rewriting this gateway body.
 func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r *http.Request, username string, subscribeFile storage.SubscribeFile) {
 	if !subscribeFile.ProviderLinkEnabled {
 		writeError(w, http.StatusNotFound, errors.New("not found"))
@@ -2835,7 +2890,9 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 			return nil, errors.New("没有可用且来源地址有效的 client provider（可能已失效或未选择）")
 		}
 		gatewayURLs := buildSubscriptionProviderGatewayURLs(request, providerConfigs)
-		result, err := processProviderOnlyV3Template(string(templateContent), providerConfigs, providerURLs, gatewayURLs)
+		ownerSettings, settingsErr := h.repo.GetUserSettings(ctx, nodeOwner)
+		nodeNameFilter := providerTemplateNodeNameFilter(ownerSettings, settingsErr)
+		result, err := processProviderOnlyV3Template(string(templateContent), providerConfigs, providerURLs, gatewayURLs, nodeNameFilter)
 		if err != nil {
 			return nil, fmt.Errorf("处理 Provider 模板失败: %w", err)
 		}
@@ -2972,7 +3029,18 @@ func filterUsableClientProxyProviders(providerConfigs []storage.ProxyProviderCon
 	return filtered
 }
 
-func processProviderOnlyV3Template(templateContent string, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string) (string, error) {
+// providerTemplateNodeNameFilter returns the node-pool owner's node_name_filter.
+// Non-admin subscriptions reuse the admin Provider/node pool, so this must match
+// the filter used during the owner's external sync. Load failure falls back to
+// defaultNodeNameFilterPattern, same as external_sync.
+func providerTemplateNodeNameFilter(ownerSettings storage.UserSettings, loadErr error) string {
+	if loadErr != nil {
+		return defaultNodeNameFilterPattern
+	}
+	return ownerSettings.NodeNameFilter
+}
+
+func processProviderOnlyV3Template(templateContent string, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string, nodeNameFilter string) (string, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
 		return "", err
@@ -2995,7 +3063,7 @@ func processProviderOnlyV3Template(templateContent string, providerConfigs []sto
 	}
 
 	rootMap := root.Content[0]
-	injectClientProxyProviders(rootMap, clientConfigs, providerURLs, gatewayURLs)
+	injectClientProxyProviders(rootMap, clientConfigs, providerURLs, gatewayURLs, nodeNameFilter)
 	rewriteProxyGroupsForProviderMode(rootMap, providerNames)
 
 	var buf strings.Builder
@@ -3010,7 +3078,7 @@ func processProviderOnlyV3Template(templateContent string, providerConfigs []sto
 	return buf.String(), nil
 }
 
-func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string) {
+func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.ProxyProviderConfig, providerURLs, gatewayURLs map[int64]string, nodeNameFilter string) {
 	var proxyProvidersNode *yaml.Node
 	for i := 0; i < len(rootMap.Content)-1; i += 2 {
 		if rootMap.Content[i].Value == "proxy-providers" && rootMap.Content[i+1].Kind == yaml.MappingNode {
@@ -3034,7 +3102,7 @@ func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.Pr
 		if providerURL == "" {
 			continue
 		}
-		providerNode := createClientProxyProviderYAMLNode(&config, providerURL)
+		providerNode := createClientProxyProviderYAMLNode(&config, providerURL, nodeNameFilter)
 		replaced := false
 		for i := 0; i < len(proxyProvidersNode.Content)-1; i += 2 {
 			if proxyProvidersNode.Content[i].Value == config.Name {
@@ -3052,7 +3120,38 @@ func injectClientProxyProviders(rootMap *yaml.Node, providerConfigs []storage.Pr
 	}
 }
 
-func createClientProxyProviderYAMLNode(config *storage.ProxyProviderConfig, providerURL string) *yaml.Node {
+func usableNodeNameFilterPattern(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return ""
+	}
+	return pattern
+}
+
+// mergeProxyProviderExcludeFilter unions a provider exclude-filter with the
+// user node_name_filter. Invalid or empty node_name_filter is skipped, matching
+// the external-sync path. An existing provider rule is always preserved.
+func mergeProxyProviderExcludeFilter(providerExclude, nodeNameFilter string) string {
+	providerExclude = strings.TrimSpace(providerExclude)
+	nodeNameFilter = usableNodeNameFilterPattern(nodeNameFilter)
+	switch {
+	case providerExclude == "" && nodeNameFilter == "":
+		return ""
+	case providerExclude == "":
+		return nodeNameFilter
+	case nodeNameFilter == "":
+		return providerExclude
+	case providerExclude == nodeNameFilter:
+		return providerExclude
+	default:
+		return "(?:" + providerExclude + ")|(?:" + nodeNameFilter + ")"
+	}
+}
+
+func createClientProxyProviderYAMLNode(config *storage.ProxyProviderConfig, providerURL, nodeNameFilter string) *yaml.Node {
 	node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 	addScalar := func(key, value string) {
 		if value == "" {
@@ -3096,8 +3195,8 @@ func createClientProxyProviderYAMLNode(config *storage.ProxyProviderConfig, prov
 	if config.Filter != "" {
 		addScalar("filter", config.Filter)
 	}
-	if config.ExcludeFilter != "" {
-		addScalar("exclude-filter", config.ExcludeFilter)
+	if exclude := mergeProxyProviderExcludeFilter(config.ExcludeFilter, nodeNameFilter); exclude != "" {
+		addScalar("exclude-filter", exclude)
 	}
 	if config.ExcludeType != "" {
 		addScalar("exclude-type", config.ExcludeType)

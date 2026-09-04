@@ -87,6 +87,41 @@ func TestSourceNodeMatchIndexDoesNotCrossSources(t *testing.T) {
 	}
 }
 
+func TestNodeNameCollisionFallsBackToUniqueSourceEndpoint(t *testing.T) {
+	nodes := []storage.Node{
+		{RawURL: "other-source", NodeName: "same", ClashConfig: `{"name":"same","type":"ss","server":"other.example","port":443}`},
+		{RawURL: "target-source", NodeName: "same-2", ClashConfig: `{"name":"same-2","type":"ss","server":"target.example","port":443}`},
+	}
+	idx := buildSourceNodeMatchIndex(nodes, "target-source")
+	incoming := map[string]any{"name": "same", "type": "ss", "server": "target.example", "port": 443}
+	if !nodeNameTakenOutsideSource(nodes, "target-source", "same") {
+		t.Fatal("expected an outside-source name collision")
+	}
+	if got := idx.findUniqueEndpoint(incoming); got != 1 {
+		t.Fatalf("endpoint fallback index = %d, want 1", got)
+	}
+}
+
+func TestNodeNameCollisionDoesNotGuessAmbiguousEndpoint(t *testing.T) {
+	nodes := []storage.Node{
+		{RawURL: "target", NodeName: "one", ClashConfig: `{"name":"one","type":"ss","server":"same.example","port":443}`},
+		{RawURL: "target", NodeName: "two", ClashConfig: `{"name":"two","type":"ss","server":"same.example","port":443}`},
+	}
+	idx := buildSourceNodeMatchIndex(nodes, "target")
+	if got := idx.findUniqueEndpoint(map[string]any{"type": "ss", "server": "same.example", "port": 443}); got != -1 {
+		t.Fatalf("ambiguous endpoint matched index %d", got)
+	}
+}
+
+func TestManualSelectionDefersOrphanCleanup(t *testing.T) {
+	if shouldCleanupExternalSyncOrphans("all", true) {
+		t.Fatal("manual selection preview must not delete unmatched source nodes")
+	}
+	if !shouldCleanupExternalSyncOrphans("all", false) {
+		t.Fatal("completed automatic sync should clean source orphans")
+	}
+}
+
 func TestNodeSyncPayloadEqualDetectsMaterialChanges(t *testing.T) {
 	base := storage.Node{
 		RawURL:       "source",

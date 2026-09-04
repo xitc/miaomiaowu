@@ -48,7 +48,7 @@ func TestProviderTemplateExcludesProvidersWithoutSourceURL(t *testing.T) {
     type: select
     include-all-providers: true
 `
-	result, err := processProviderOnlyV3Template(template, configs, urls, nil)
+	result, err := processProviderOnlyV3Template(template, configs, urls, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestProviderTemplateUsesSubscriptionGatewayURL(t *testing.T) {
     include-all-providers: true
 `
 
-	result, err := processProviderOnlyV3Template(template, configs, upstreamURLs, gatewayURLs)
+	result, err := processProviderOnlyV3Template(template, configs, upstreamURLs, gatewayURLs, "")
 	if err != nil {
 		t.Fatal(err)
 	}

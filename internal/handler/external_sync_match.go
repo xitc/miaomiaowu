@@ -73,9 +73,11 @@ func doExternalSyncSingleflight(key string, fn func() (int, storage.ExternalSubs
 
 // nodeMatchIndex indexes only nodes from one source URL for O(1) matching.
 type nodeMatchIndex struct {
-	byName           map[string]int
-	byServerPort     map[string]int
-	byTypeServerPort map[string]int
+	byName                  map[string]int
+	byServerPort            map[string]int
+	byTypeServerPort        map[string]int
+	ambiguousServerPort     map[string]bool
+	ambiguousTypeServerPort map[string]bool
 }
 
 func portKey(port any) string {
@@ -84,9 +86,11 @@ func portKey(port any) string {
 
 func buildSourceNodeMatchIndex(existing []storage.Node, sourceURL string) *nodeMatchIndex {
 	idx := &nodeMatchIndex{
-		byName:           make(map[string]int, len(existing)),
-		byServerPort:     make(map[string]int, len(existing)),
-		byTypeServerPort: make(map[string]int, len(existing)),
+		byName:                  make(map[string]int, len(existing)),
+		byServerPort:            make(map[string]int, len(existing)),
+		byTypeServerPort:        make(map[string]int, len(existing)),
+		ambiguousServerPort:     make(map[string]bool),
+		ambiguousTypeServerPort: make(map[string]bool),
 	}
 	for i := range existing {
 		if existing[i].RawURL != sourceURL {
@@ -111,18 +115,62 @@ func buildSourceNodeMatchIndex(existing []storage.Node, sourceURL string) *nodeM
 		typeName, _ := cfg["type"].(string)
 		if server != "" && port != "" && port != "<nil>" {
 			sp := strings.ToLower(server) + "\x00" + port
-			if _, ok := idx.byServerPort[sp]; !ok {
+			if previous, ok := idx.byServerPort[sp]; ok && previous != i {
+				idx.ambiguousServerPort[sp] = true
+			} else if !ok {
 				idx.byServerPort[sp] = i
 			}
 			if typeName != "" {
 				tsp := strings.ToLower(typeName) + "\x00" + sp
-				if _, ok := idx.byTypeServerPort[tsp]; !ok {
+				if previous, ok := idx.byTypeServerPort[tsp]; ok && previous != i {
+					idx.ambiguousTypeServerPort[tsp] = true
+				} else if !ok {
 					idx.byTypeServerPort[tsp] = i
 				}
 			}
 		}
 	}
 	return idx
+}
+
+// findUniqueEndpoint is a conservative fallback for source nodes whose imported
+// names were suffixed to avoid a collision with another subscription. It never
+// guesses when multiple nodes in the same source share the endpoint.
+func (idx *nodeMatchIndex) findUniqueEndpoint(newConfig map[string]any) int {
+	newServer, _ := newConfig["server"].(string)
+	newPort := portKey(newConfig["port"])
+	newType, _ := newConfig["type"].(string)
+	if newServer == "" || newPort == "" || newPort == "<nil>" {
+		return -1
+	}
+	sp := strings.ToLower(newServer) + "\x00" + newPort
+	if newType != "" {
+		tsp := strings.ToLower(newType) + "\x00" + sp
+		if !idx.ambiguousTypeServerPort[tsp] {
+			if i, ok := idx.byTypeServerPort[tsp]; ok {
+				return i
+			}
+		}
+	}
+	if !idx.ambiguousServerPort[sp] {
+		if i, ok := idx.byServerPort[sp]; ok {
+			return i
+		}
+	}
+	return -1
+}
+
+func nodeNameTakenOutsideSource(nodes []storage.Node, sourceURL, nodeName string) bool {
+	for _, node := range nodes {
+		if node.RawURL != sourceURL && node.NodeName == nodeName {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldCleanupExternalSyncOrphans(syncScope string, deferNewNodes bool) bool {
+	return syncScope == "all" && !deferNewNodes
 }
 
 func (idx *nodeMatchIndex) find(matchRule string, nodeName string, newCfg map[string]any) int {
