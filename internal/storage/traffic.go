@@ -205,6 +205,7 @@ type ProbeServer struct {
 
 // Node represents a proxy node stored in the database.
 type Node struct {
+	SourceNodeName    string // Original name from the owning external source; independent of display aliases.
 	ID                int64
 	Username          string
 	RawURL            string
@@ -740,6 +741,10 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 
 	if _, err := r.db.Exec(nodesSchema); err != nil {
 		return fmt.Errorf("migrate nodes: %w", err)
+	}
+
+	if err := r.ensureNodeColumn("source_node_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
 
 	// Add tag column to existing nodes table if it doesn't exist

@@ -223,7 +223,7 @@ func (idx *nodeMatchIndex) find(matchRule string, nodeName string, newCfg map[st
 // nodeSyncPayloadEqual reports whether an existing DB node already matches the
 // incoming external node content (so UpdateNode can be skipped).
 func nodeSyncPayloadEqual(existing storage.Node, incoming storage.Node, keepNodeName bool) bool {
-	if existing.RawURL != incoming.RawURL {
+	if existing.RawURL != incoming.RawURL || existing.SourceNodeName != incoming.SourceNodeName {
 		return false
 	}
 	if existing.Protocol != incoming.Protocol {

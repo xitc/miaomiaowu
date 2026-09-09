@@ -654,6 +654,7 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 	matchIndex := buildSourceNodeMatchIndex(existingNodes, sub.URL)
 
 	for _, node := range nodesToUpdate {
+		node.SourceNodeName = node.NodeName
 		var newNodeClashConfig map[string]any
 		if err := json.Unmarshal([]byte(node.ClashConfig), &newNodeClashConfig); err != nil {
 			continue
@@ -672,6 +673,7 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 			// Build candidate update without mutating index source until we know it changes.
 			candidate := existingNode
 			candidate.RawURL = node.RawURL
+			candidate.SourceNodeName = node.SourceNodeName
 			candidate.Protocol = node.Protocol
 			candidate.ParsedConfig = node.ParsedConfig
 			candidate.ClashConfig = node.ClashConfig

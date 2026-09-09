@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { NodeGroupsView } from '@/components/node-groups-view'
 import React, {
   useState,
   useMemo,
@@ -1104,6 +1105,8 @@ function NodesPage() {
     enabled: Boolean(auth.accessToken),
   })
 
+  const [aggregateView, setAggregateView] = useState(true)
+  const [sourceGroupIds, setSourceGroupIds] = useState<number[] | null>(null)
   const savedNodes = useMemo(() => nodesData?.nodes ?? [], [nodesData?.nodes])
   const nodeIdToName = useMemo(() => {
     const map = new Map<number, string>()
@@ -3214,7 +3217,7 @@ function NodesPage() {
   )
 
   const filteredNodes = useMemo(() => {
-    let nodes = displayNodes
+    let nodes = sourceGroupIds ? displayNodes.filter((n) => sourceGroupIds.includes(n.dbId)) : displayNodes
 
     // 按协议筛选
     if (selectedProtocol !== 'all') {
@@ -3230,7 +3233,7 @@ function NodesPage() {
     }
 
     return nodes
-  }, [displayNodes, selectedProtocol, tagFilter])
+  }, [displayNodes, selectedProtocol, tagFilter, sourceGroupIds])
 
   const deferredFilteredNodes = useDeferredValue(filteredNodes)
 
@@ -3462,10 +3465,24 @@ function NodesPage() {
     }
   }, [nodesData, tagCounts, protocolCounts, tagFilter, selectedProtocol])
 
+  if (aggregateView) {
+    return <NodeGroupsView onManage={(ids) => {
+      setSourceGroupIds(ids ?? null)
+      setTagFilter('all')
+      setSelectedProtocol('all')
+      setSelectedNodeIds(new Set())
+      setAggregateView(false)
+    }} />
+  }
+
   return (
     <div className='bg-background min-h-svh'>
       <main className='mx-auto w-full max-w-7xl px-4 py-8 pt-24 sm:px-6'>
         <section className='space-y-4'>
+          <div className='flex flex-wrap items-center gap-3'>
+            <Button variant='outline' onClick={() => setAggregateView(true)}>返回聚合节点</Button>
+            {sourceGroupIds && <><span className='text-muted-foreground text-sm'>正在管理所选节点的独立来源记录</span><Button variant='ghost' onClick={() => setSourceGroupIds(null)}>显示所有来源</Button></>}
+          </div>
           <div>
             <h1 className='text-3xl font-semibold tracking-tight'>节点管理</h1>
             <p className='text-muted-foreground mt-2'>

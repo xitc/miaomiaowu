@@ -230,6 +230,16 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Query().Get("view") == "grouped" {
+		groups, err := loadNodeGroups(r.Context(), h.repo, username)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"groups": groups})
+		return
+	}
+
 	nodes, err := h.repo.ListNodes(r.Context(), username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

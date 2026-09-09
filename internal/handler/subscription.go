@@ -852,6 +852,20 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		ext = ".yaml"
 	}
 
+	if !fromSurgeTemplate && !fromLoonTemplate && outputMode == storage.OutputModeNormal && h.repo != nil && username != "" {
+		owner := username
+		if u, err := h.repo.GetUser(r.Context(), username); err == nil && u.Role != storage.RoleAdmin {
+			if admin, err := h.repo.GetAdminUsername(r.Context()); err == nil {
+				owner = admin
+			}
+		}
+		if groups, err := loadNodeGroups(r.Context(), h.repo, owner); err == nil {
+			if grouped, err := aggregateSubscriptionNodes(data, groups); err == nil {
+				data = grouped
+			}
+		}
+	}
+
 	data = deduplicateProxies(data, username)
 
 	// v2ray 订阅信息节点(SubInfoV2RayOnly):v2ray/base64 输出没有 proxies 结构可供事后注入,
