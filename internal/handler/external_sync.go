@@ -156,9 +156,10 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 	}
 
 	matchRuleDesc := map[string]string{
-		"node_name":        "节点名称",
-		"server_port":      "服务器:端口",
-		"type_server_port": "类型:服务器:端口",
+		"node_name":             "节点名称",
+		"server_port":           "服务器:端口",
+		"type_server_port":      "类型:服务器:端口",
+		"type_server_port_cred": "类型:服务器:端口:凭据",
 	}
 	syncScopeDesc := map[string]string{
 		"saved_only": "仅同步已保存节点",
@@ -238,9 +239,10 @@ func syncExternalSubscriptions(ctx context.Context, repo *storage.TrafficReposit
 	}
 
 	matchRuleDesc := map[string]string{
-		"node_name":        "节点名称",
-		"server_port":      "服务器:端口",
-		"type_server_port": "类型:服务器:端口",
+		"node_name":             "节点名称",
+		"server_port":           "服务器:端口",
+		"type_server_port":      "类型:服务器:端口",
+		"type_server_port_cred": "类型:服务器:端口:凭据",
 	}
 	syncScopeDesc := map[string]string{
 		"saved_only": "仅同步已保存节点",
@@ -383,6 +385,21 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		count, updatedSub, _, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, settings, false)
 		return count, updatedSub, err
 	})
+}
+
+// nodeCredentialKey 从 clash 配置里提取能区分不同用户的凭据字段,拼成一个稳定的 key。
+// 不同协议凭据字段不同(vmess/vless/tuic 用 uuid,trojan/ss 用 password,mieru 用
+// username+password),这里把常见的都收进来 —— 同 server:port 下,凭据不同即不同用户。
+func nodeCredentialKey(cfg map[string]any) string {
+	var parts []string
+	for _, k := range []string{"uuid", "password", "username", "auth-str", "auth_str", "psk", "token"} {
+		if v, ok := cfg[k]; ok {
+			if s := fmt.Sprintf("%v", v); s != "" {
+				parts = append(parts, k+"="+s)
+			}
+		}
+	}
+	return strings.Join(parts, "&")
 }
 
 func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings, deferNewNodes bool) (int, storage.ExternalSubscription, []externalSyncCandidate, error) {

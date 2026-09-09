@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"miaomiaowu/internal/storage"
 	"miaomiaowu/internal/util"
@@ -15,6 +16,7 @@ import (
 func TestStoreSubscriptionContentCacheReusesFreshSyncPayload(t *testing.T) {
 	payload := []byte("proxies:\n  - name: cached\n    type: ss\n")
 	var upstreamRequests atomic.Int32
+	useLocalProviderContentClient(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamRequests.Add(1)
 		_, _ = w.Write(payload)
@@ -98,4 +100,11 @@ func TestRefreshProxyProviderCacheReusesParsedTreeAndIsolatesConfigs(t *testing.
 			t.Fatalf("provider override mutated shared source tree: udp=%q", got)
 		}
 	}
+}
+
+func useLocalProviderContentClient(t *testing.T) {
+	t.Helper()
+	old := newProviderContentHTTPClient
+	newProviderContentHTTPClient = func(timeout time.Duration) *http.Client { return &http.Client{Timeout: timeout} }
+	t.Cleanup(func() { newProviderContentHTTPClient = old })
 }

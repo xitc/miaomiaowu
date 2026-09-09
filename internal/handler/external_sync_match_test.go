@@ -157,3 +157,20 @@ func TestNodeSyncPayloadEqualDetectsMaterialChanges(t *testing.T) {
 		t.Fatal("tag change must not be skipped as an unchanged payload")
 	}
 }
+
+func TestCredentialMatchingStaysWithinSourceAndDistinguishesUsers(t *testing.T) {
+	nodes := []storage.Node{
+		{RawURL: "a", NodeName: "first", ClashConfig: `{"type":"vless","server":"same.example","port":443,"uuid":"first"}`},
+		{RawURL: "a", NodeName: "second", ClashConfig: `{"type":"vless","server":"same.example","port":443,"uuid":"second"}`},
+		{RawURL: "b", NodeName: "foreign", ClashConfig: `{"type":"vless","server":"same.example","port":443,"uuid":"foreign"}`},
+	}
+	idx := buildSourceNodeMatchIndex(nodes, "a")
+	cfg := map[string]any{"type": "vless", "server": "same.example", "port": 443, "uuid": "second"}
+	if got := idx.find("type_server_port_cred", "renamed", cfg); got != 1 {
+		t.Fatalf("index=%d", got)
+	}
+	cfg["uuid"] = "foreign"
+	if got := idx.find("type_server_port_cred", "renamed", cfg); got != -1 {
+		t.Fatalf("foreign index=%d", got)
+	}
+}

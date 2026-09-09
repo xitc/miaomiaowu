@@ -177,6 +177,8 @@ func NewProxyProviderServeHandler(repo *storage.TrafficRepository) http.Handler 
 }
 
 // fetchSubscriptionContent fetches subscription content with caching (5 min TTL)
+var newProviderContentHTTPClient = newSSRFSafeHTTPClient
+
 func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error) {
 	cacheKey := sub.URL
 
@@ -194,7 +196,9 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	logger.Info("[SubscriptionCache] 缓存未命中，正在拉取", "url", sub.URL)
 
 	// 拉取订阅内容
-	client := &http.Client{Timeout: 30 * time.Second}
+	// [安全] URL 来自用户创建的外部订阅,且响应体会被回写给客户端 —— 必须走 SSRF 安全客户端,
+	// 否则可回显内网/云元数据响应(read-SSRF exfil)。
+	client := newProviderContentHTTPClient(30 * time.Second)
 	req, err := http.NewRequest(http.MethodGet, sub.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)

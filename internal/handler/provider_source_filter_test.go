@@ -523,6 +523,7 @@ func newProviderSourceHTTPHarness(t *testing.T, payload []byte, ownerFilter stri
 		filename:   "provider-source.yaml",
 	}
 
+	useLocalProviderContentClient(t)
 	h.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		h.upstreamHits.Add(1)
 		w.Header().Set("Content-Type", "text/yaml")

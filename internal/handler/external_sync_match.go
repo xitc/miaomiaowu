@@ -74,6 +74,7 @@ func doExternalSyncSingleflight(key string, fn func() (int, storage.ExternalSubs
 // nodeMatchIndex indexes only nodes from one source URL for O(1) matching.
 type nodeMatchIndex struct {
 	byName                  map[string]int
+	byCredential            map[string]int
 	byServerPort            map[string]int
 	byTypeServerPort        map[string]int
 	ambiguousServerPort     map[string]bool
@@ -87,6 +88,7 @@ func portKey(port any) string {
 func buildSourceNodeMatchIndex(existing []storage.Node, sourceURL string) *nodeMatchIndex {
 	idx := &nodeMatchIndex{
 		byName:                  make(map[string]int, len(existing)),
+		byCredential:            make(map[string]int),
 		byServerPort:            make(map[string]int, len(existing)),
 		byTypeServerPort:        make(map[string]int, len(existing)),
 		ambiguousServerPort:     make(map[string]bool),
@@ -122,6 +124,10 @@ func buildSourceNodeMatchIndex(existing []storage.Node, sourceURL string) *nodeM
 			}
 			if typeName != "" {
 				tsp := strings.ToLower(typeName) + "\x00" + sp
+				credentialKey := tsp + "\x00" + nodeCredentialKey(cfg)
+				if _, ok := idx.byCredential[credentialKey]; !ok {
+					idx.byCredential[credentialKey] = i
+				}
 				if previous, ok := idx.byTypeServerPort[tsp]; ok && previous != i {
 					idx.ambiguousTypeServerPort[tsp] = true
 				} else if !ok {
@@ -182,6 +188,14 @@ func (idx *nodeMatchIndex) find(matchRule string, nodeName string, newCfg map[st
 	newType, _ := newCfg["type"].(string)
 
 	switch matchRule {
+	case "type_server_port_cred":
+		if newServer != "" && newPort != "" && newPort != "<nil>" && newType != "" {
+			key := strings.ToLower(newType) + "\x00" + strings.ToLower(newServer) + "\x00" + newPort + "\x00" + nodeCredentialKey(newCfg)
+			if i, ok := idx.byCredential[key]; ok {
+				return i
+			}
+		}
+		return -1
 	case "type_server_port":
 		if newServer != "" && newPort != "" && newPort != "<nil>" && newType != "" {
 			key := strings.ToLower(newType) + "\x00" + strings.ToLower(newServer) + "\x00" + newPort

@@ -397,7 +397,7 @@ const wsParser = (proxy: Proxy, parsedProxy: ParsedProxy): void => {
   if (proxy['ws-path'] && proxy['ws-path'] !== '') transport.path = `${proxy['ws-path']}`
   if (transport.path) {
     const reg = /^(.*?)(?:\?ed=(\d+))?$/
-     
+
     const [_, path = '', ed = ''] = reg.exec(transport.path) ?? []
     transport.path = path
     if (ed !== '') {
@@ -766,7 +766,7 @@ const ssParser = (proxy: Proxy = {} as Proxy): ParsedProxy => {
   return parsedProxy
 }
 
- 
+
 const ssrParser = (proxy: Proxy = {} as Proxy): ParsedProxy => {
   const parsedProxy: ParsedProxy = {
     tag: proxy.name,

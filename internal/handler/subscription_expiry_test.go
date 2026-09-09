@@ -18,6 +18,7 @@ import (
 
 func TestSubscriptionExpiryControlsNormalAndProviderGateway(t *testing.T) {
 	var upstreamRequests atomic.Int32
+	useLocalProviderContentClient(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamRequests.Add(1)
 		w.Header().Set("Content-Type", "text/yaml")
