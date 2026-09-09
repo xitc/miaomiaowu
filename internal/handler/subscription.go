@@ -575,9 +575,8 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 					if len(expiredSubs) == 0 {
 						logger.Info("[Subscription] All referenced subscriptions are within cache time, skipping sync")
 					} else {
-						// Stale-while-revalidate:
-						// - Provider mode never blocks (response is URL shell; clients pull providers themselves).
-						// - Normal mode blocks only for never-synced refs (no nodes yet); expired cache refreshes in background.
+						// Normal output must include refreshed nodes in this response whenever
+						// its sources have no valid cache. Provider output is only a URL shell.
 						blockingSubs, backgroundSubs := splitExternalSyncUrgency(expiredSubs, outputMode)
 						if len(backgroundSubs) > 0 {
 							scheduleBackgroundReferencedExternalSync(h.repo, h.baseDir, username, backgroundSubs)
@@ -1456,24 +1455,13 @@ func selectedProviderExternalSubscriptionURLs(file storage.SubscribeFile, output
 	return used
 }
 
-// splitExternalSyncUrgency separates first-time (blocking) syncs from expired-cache
-// refreshes that can run in the background. Provider mode never blocks.
+// splitExternalSyncUrgency waits for sources without a valid cache before returning
+// normal output. Provider output contains source URLs and can refresh in background.
 func splitExternalSyncUrgency(subs []storage.ExternalSubscription, outputMode string) (blocking, background []storage.ExternalSubscription) {
-	if len(subs) == 0 {
-		return nil, nil
-	}
-	// Provider 输出只注入 proxy-provider URL，客户端自行拉取；订阅接口无需等节点池刷新。
 	if storage.NormalizeDefaultOutputMode(outputMode) == storage.OutputModeProvider {
 		return nil, subs
 	}
-	for _, sub := range subs {
-		if sub.LastSyncAt == nil {
-			blocking = append(blocking, sub)
-		} else {
-			background = append(background, sub)
-		}
-	}
-	return blocking, background
+	return subs, nil
 }
 
 var backgroundReferencedSync = struct {
@@ -1518,6 +1506,8 @@ func scheduleBackgroundReferencedExternalSync(repo *storage.TrafficRepository, s
 	}()
 }
 
+var newReferencedSyncHTTPClient = newSSRFSafeHTTPClient
+
 // syncReferencedExternalSubscriptions syncs only the specified external subscriptions.
 // Multiple subscriptions are synced in parallel (bounded) to cut multi-source latency.
 func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string, subsToSync []storage.ExternalSubscription) error {
@@ -1537,7 +1527,7 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 	logger.Info("[Subscription] 用户需要同步的外部订阅", "user", username, "count", len(subsToSync), "match_rule", userSettings.MatchRule)
 
-	client := newSSRFSafeHTTPClient(20 * time.Second)
+	client := newReferencedSyncHTTPClient(20 * time.Second)
 
 	const maxParallel = 3
 	sem := make(chan struct{}, maxParallel)

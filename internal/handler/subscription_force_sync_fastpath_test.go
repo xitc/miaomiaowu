@@ -48,12 +48,12 @@ func TestSplitExternalSyncUrgency(t *testing.T) {
 		t.Fatalf("provider: blocking=%d bg=%d", len(b), len(bg))
 	}
 
-	// Normal: first-time blocks, expired backgrounds
+	// Normal: both first-time and expired sources must finish before output.
 	b, bg = splitExternalSyncUrgency(subs, storage.OutputModeNormal)
-	if len(b) != 1 || b[0].Name != "first" {
+	if len(b) != 2 || b[0].Name != "first" || b[1].Name != "expired" {
 		t.Fatalf("normal blocking=%v", b)
 	}
-	if len(bg) != 1 || bg[0].Name != "expired" {
+	if len(bg) != 0 {
 		t.Fatalf("normal bg=%v", bg)
 	}
 }
@@ -84,5 +84,20 @@ func TestProviderModeEmptySelectionReferencesAllClientProviders(t *testing.T) {
 	got := selectedProviderExternalSubscriptionURLs(file, storage.OutputModeProvider, configs, subs)
 	if !got["client-url"] || got["mmw-url"] || len(got) != 1 {
 		t.Fatalf("unexpected default Provider URLs: %v", got)
+	}
+}
+
+func TestNoCacheNormalSubscriptionWaitsForPreviouslySyncedSources(t *testing.T) {
+	now := time.Now()
+	subs := []storage.ExternalSubscription{{Name: "existing", LastSyncAt: &now}, {Name: "new"}}
+	for _, minutes := range []int{0, -1} {
+		blocking, background := splitExternalSyncUrgency(filterExternalSubsNeedingSync(subs, minutes), storage.OutputModeNormal)
+		if len(blocking) != 2 || len(background) != 0 {
+			t.Fatalf("cache=%d: blocking=%d background=%d", minutes, len(blocking), len(background))
+		}
+		blocking, background = splitExternalSyncUrgency(subs, storage.OutputModeProvider)
+		if len(blocking) != 0 || len(background) != 2 {
+			t.Fatalf("provider cache=%d: blocking=%d background=%d", minutes, len(blocking), len(background))
+		}
 	}
 }
