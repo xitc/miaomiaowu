@@ -10,6 +10,7 @@ import (
 
 	"miaomiaowu/internal/logger"
 	"miaomiaowu/internal/notify"
+	"miaomiaowu/internal/storage"
 )
 
 const (
@@ -18,6 +19,10 @@ const (
 )
 
 type subscriptionFetchNotice struct {
+	RequestedAt  time.Time
+	Duration     time.Duration
+	ProviderName string
+	OutputMode   string
 	Username     string
 	Subscription string
 	ClientType   string
@@ -32,6 +37,7 @@ func queueSubscriptionFetchNotification(notice subscriptionFetchNotice) {
 	}
 
 	notice.Username = sanitizeNotificationValue(notice.Username, 100)
+	notice.ProviderName = sanitizeNotificationValue(notice.ProviderName, 160)
 	notice.Subscription = sanitizeNotificationValue(notice.Subscription, 160)
 	notice.ClientType = sanitizeNotificationValue(notice.ClientType, 80)
 	notice.UserAgent = sanitizeNotificationValue(notice.UserAgent, 240)
@@ -69,19 +75,36 @@ func sendSubscriptionFetchNotification(n *notify.Notifier, notice subscriptionFe
 		Type:      notify.EventSubscribeFetch,
 		Title:     "订阅获取",
 		PlainText: true,
-		Message: fmt.Sprintf(
-			"用户: %s\n订阅: %s\n客户端: %s\nUA: %s\nIP: %s\nIP属地: %s",
-			notice.Username,
-			notice.Subscription,
-			notice.ClientType,
-			notice.UserAgent,
-			notice.ClientIP,
-			location,
-		),
+		Message:   formatSubscriptionFetchMessage(notice, location),
 	}
 	if err := n.Send(ctx, event); err != nil {
 		logger.Warn("[Notify] 订阅获取通知发送失败", "error", err)
 	}
+}
+
+func formatSubscriptionFetchMessage(notice subscriptionFetchNotice, location string) string {
+	mode := "未知"
+	switch notice.OutputMode {
+	case storage.OutputModeNormal:
+		mode = "普通订阅"
+	case storage.OutputModeProvider:
+		mode = "Provider"
+	case providerSourceOutputMode:
+		mode = "提供者节点"
+	case "raw":
+		mode = "原始输出"
+	}
+	requestedAt := "未知"
+	if !notice.RequestedAt.IsZero() {
+		requestedAt = notice.RequestedAt.In(time.FixedZone("北京时间", 8*60*60)).Format("2006-01-02 15:04:05") + "（北京时间）"
+	}
+	provider := ""
+	if notice.OutputMode == providerSourceOutputMode {
+		provider = "\n提供者: " + notice.ProviderName
+	}
+	return fmt.Sprintf("用户: %s\n订阅: %s\n请求时间: %s\n输出模式: %s%s\n服务端耗时: %d ms\n客户端: %s\nUA: %s\nIP: %s\nIP属地: %s",
+		notice.Username, notice.Subscription, requestedAt, mode, provider, notice.Duration.Milliseconds(),
+		notice.ClientType, notice.UserAgent, notice.ClientIP, location)
 }
 
 func describeIPLocation(ctx context.Context, ipString string) string {

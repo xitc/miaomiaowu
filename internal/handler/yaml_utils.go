@@ -9,6 +9,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Immutable patterns are safe to reuse across concurrent subscription requests.
+var (
+	nameserverPolicyRe = regexp.MustCompile(`(?ms)^(nameserver-policy:\s*\n)((?:[ \t]+.+\n?)*)`)
+	quotedUnicodeRe    = regexp.MustCompile(`"([^"]*\\[Uu][0-9A-Fa-f]{4,8}[^"]*)"`)
+	escapeRe           = regexp.MustCompile(`\\U([0-9A-Fa-f]{8})|\\u([0-9A-Fa-f]{4})`)
+	numericQuotesRe    = regexp.MustCompile(`(?m)^(\s*)(port|socks-port|redir-port|tproxy-port|mixed-port|dns-port|interval|timeout|geo-update-interval|update-interval|size-limit|size_limit|health-check-interval|health-check-timeout):\s+"(\d+)"`)
+)
+
 // MarshalYAMLWithIndent marshals a YAML node with 2-space indentation
 func MarshalYAMLWithIndent(node *yaml.Node) ([]byte, error) {
 	// Sanitize explicit string tags before encoding to prevent !!str from appearing in output
@@ -47,7 +55,6 @@ func MarshalWithIndent(v interface{}) ([]byte, error) {
 func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 	// 使用占位符保留原始nameserver-policy配置
 	var nameserverPolicyBlock string
-	nameserverPolicyRe := regexp.MustCompile(`(?ms)^(nameserver-policy:\s*\n)((?:[ \t]+.+\n?)*)`)
 	yamlContent = nameserverPolicyRe.ReplaceAllStringFunc(yamlContent, func(match string) string {
 		nameserverPolicyBlock = match
 		return "___NAMESERVER_POLICY_PLACEHOLDER___\n"
@@ -56,7 +63,6 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 	// Step 1: Remove quotes from strings that contain Unicode escape sequences
 	// Pattern: "...\U000XXXXX..." or "...\uXXXX..."
 	// But keep quotes if the unquoted string would start with YAML special characters
-	quotedUnicodeRe := regexp.MustCompile(`"([^"]*\\[Uu][0-9A-Fa-f]{4,8}[^"]*)"`)
 	result := quotedUnicodeRe.ReplaceAllStringFunc(yamlContent, func(match string) string {
 		// Get the content without quotes
 		content := strings.Trim(match, `"`)
@@ -89,14 +95,6 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 
 	// Step 3: Remove quotes from numeric values for known numeric fields
 	// Only unquote fields that are expected to be numbers to avoid changing string-typed fields like name/server.
-	numericFields := []string{
-		"port", "socks-port", "redir-port", "tproxy-port", "mixed-port", "dns-port",
-		"interval", "timeout", "geo-update-interval", "update-interval",
-		"size-limit", "size_limit",
-		"health-check-interval", "health-check-timeout",
-	}
-	numericFieldsPattern := fmt.Sprintf(`(?m)^(\s*)(%s):\s+"(\d+)"`, strings.Join(numericFields, "|"))
-	numericQuotesRe := regexp.MustCompile(numericFieldsPattern)
 	result = numericQuotesRe.ReplaceAllString(result, `$1$2: $3`)
 
 	// 回复nameserver-policy配置
@@ -109,7 +107,9 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 
 // convertUnicodeEscapes converts Unicode escape sequences to actual characters
 func convertUnicodeEscapes(s string) string {
-	escapeRe := regexp.MustCompile(`\\U([0-9A-Fa-f]{8})|\\u([0-9A-Fa-f]{4})`)
+	if !strings.Contains(s, `\u`) && !strings.Contains(s, `\U`) {
+		return s
+	}
 	return escapeRe.ReplaceAllStringFunc(s, func(escapeSeq string) string {
 		var codepoint int
 		if strings.HasPrefix(escapeSeq, `\U`) {

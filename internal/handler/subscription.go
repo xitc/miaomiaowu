@@ -244,6 +244,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	// 性能监测：记录总开始时间
 	requestStart := time.Now()
+	r = r.WithContext(context.WithValue(r.Context(), subscriptionRequestStartKey{}, requestStart))
 	var stepStart time.Time
 
 	if r.Method != http.MethodGet {
@@ -366,7 +367,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if isProviderSourceRequest {
-		h.serveSubscriptionProvider(w, r, username, subscribeFile)
+		h.serveSubscriptionProvider(w, r, username, subscribeFile, requestStart)
 		return
 	}
 
@@ -396,13 +397,17 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		w.Header().Set("profile-update-interval", "24")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(rawData)
+		duration := time.Since(requestStart)
 
 		logger.Info("📥📥📥 [SUB_FETCH] 用户获取订阅（原始输出）",
 			"user", username, "filename", filename, "bytes", len(rawData),
-			"duration_ms", time.Since(requestStart).Milliseconds(),
+			"duration_ms", duration.Milliseconds(),
 		)
 		clientIP := GetClientIP(r)
 		queueSubscriptionFetchNotification(subscriptionFetchNotice{
+			RequestedAt:  requestStart,
+			Duration:     duration,
+			OutputMode:   "raw",
 			Username:     username,
 			Subscription: displayName,
 			ClientType:   resolveClientType(r),
@@ -621,6 +626,20 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	logger.Info("[⏱️ 耗时监测] 外部订阅同步完成", "step", "external_sync", "duration_ms", time.Since(stepStart).Milliseconds())
+
+	// Bound CPU-heavy response transformations across simultaneous subscribers.
+	// Source refresh finishes before this gate, so callers can still share it.
+	if r.Context().Err() != nil {
+		return
+	}
+	if outputMode == storage.OutputModeNormal {
+		select {
+		case subscriptionResponseSlots <- struct{}{}:
+			defer func() { <-subscriptionResponseSlots }()
+		case <-r.Context().Done():
+			return
+		}
+	}
 
 	// 流量信息收集
 	stepStart = time.Now()
@@ -1196,6 +1215,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+	duration := time.Since(requestStart)
 
 	// 📥 订阅获取日志 - 方便管理员搜索和追踪
 	logger.Info("📥📥📥 [SUB_FETCH] 用户获取订阅",
@@ -1204,12 +1224,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		"filename", filename,
 		"client_type", clientType,
 		"bytes", len(data),
-		"duration_ms", time.Since(requestStart).Milliseconds(),
+		"duration_ms", duration.Milliseconds(),
 	)
 
 	// 更新静默模式活跃时间
 	clientIP := GetClientIP(r)
 	queueSubscriptionFetchNotification(subscriptionFetchNotice{
+		RequestedAt:  requestStart,
+		Duration:     duration,
+		OutputMode:   outputMode,
 		Username:     username,
 		Subscription: displayName,
 		ClientType:   clientType,
@@ -1598,18 +1621,12 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 			defer func() { <-sem }()
 
 			subSyncStart := time.Now()
-			nodeCount, updatedSub, err := syncSingleExternalSubscription(ctx, client, repo, subscribeDir, username, sub, userSettings)
+			nodeCount, _, err := syncReferencedSource(ctx, client, repo, subscribeDir, username, sub, userSettings)
 			if err != nil {
 				logger.Info("[⏱️ 耗时监测] 同步订阅失败", "name", sub.Name, "url", sub.URL, "error", err, "duration_ms", time.Since(subSyncStart).Milliseconds())
 				return
 			}
 
-			now := time.Now()
-			updatedSub.LastSyncAt = &now
-			updatedSub.NodeCount = nodeCount
-			if err := repo.UpdateExternalSubscription(ctx, updatedSub); err != nil {
-				logger.Info("[Subscription] 更新订阅同步时间失败", "name", sub.Name, "error", err)
-			}
 			logger.Info("[⏱️ 耗时监测] 外部订阅同步完成", "name", sub.Name, "node_count", nodeCount, "duration_ms", time.Since(subSyncStart).Milliseconds())
 
 			mu.Lock()
@@ -2708,7 +2725,7 @@ func (h *SubscriptionHandler) providerNodeOwner(ctx context.Context, username st
 // provider payload after applying the node-pool owner's node_name_filter.
 // The generated proxy-providers exclude-filter remains as a second client-side
 // protection. Shared external-subscription cache bytes are never mutated.
-func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r *http.Request, username string, subscribeFile storage.SubscribeFile) {
+func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r *http.Request, username string, subscribeFile storage.SubscribeFile, requestStart time.Time) {
 	if !subscribeFile.ProviderLinkEnabled {
 		writeError(w, http.StatusNotFound, errors.New("not found"))
 		return
@@ -2777,11 +2794,26 @@ func (h *SubscriptionHandler) serveSubscriptionProvider(w http.ResponseWriter, r
 	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-	if bfp := GetBruteForceProtector(); bfp != nil {
-		bfp.RecordSuccess(GetClientIP(r))
+	if _, err := w.Write(data); err != nil {
+		return
 	}
-	logger.Info("[SubscriptionProvider] Provider 访问成功", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "bytes", len(data), "filtered_nodes", removed)
+	duration := time.Since(requestStart)
+	clientIP := GetClientIP(r)
+	queueSubscriptionFetchNotification(subscriptionFetchNotice{
+		RequestedAt:  requestStart,
+		Duration:     duration,
+		OutputMode:   providerSourceOutputMode,
+		ProviderName: config.Name,
+		Username:     username,
+		Subscription: subscribeFile.Name,
+		ClientType:   resolveClientType(r),
+		UserAgent:    r.Header.Get("User-Agent"),
+		ClientIP:     clientIP,
+	})
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.RecordSuccess(clientIP)
+	}
+	logger.Info("[SubscriptionProvider] Provider 访问成功", "subscribe_file_id", subscribeFile.ID, "provider_id", providerID, "bytes", len(data), "filtered_nodes", removed, "duration_ms", duration.Milliseconds())
 }
 
 func (h *SubscriptionHandler) serveExpiredProviderResponse(w http.ResponseWriter) {
@@ -3006,29 +3038,17 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 		return []byte(result), nil
 	}
 
-	// 4. 使用 TemplateV3Processor 处理模板
-	processor := substore.NewTemplateV3Processor(nil, providers)
-	result, err := processor.ProcessTemplate(string(templateContent), proxies)
-	if err != nil {
-		return nil, fmt.Errorf("处理模板失败: %w", err)
-	}
-
-	// 5. 注入代理节点到proxies字段（与预览保持一致）
-	// 根 proxies 字段额外包含中转组引用的底层节点，确保中转代理组引用不悬空
+	// Reuse only pure rendering with identical current inputs. Node selection,
+	// permissions and source refresh still run independently for each request.
 	rootProxies := make([]map[string]any, 0, len(proxies)+len(extraProxies))
 	rootProxies = append(rootProxies, proxies...)
 	rootProxies = append(rootProxies, extraProxies...)
-	result, err = injectProxiesIntoTemplate(result, rootProxies)
+	result, err := renderNormalSubscriptionTemplate(ctx, normalTemplateInput{
+		Template: string(templateContent), Proxies: proxies, RootProxies: rootProxies,
+		Providers: providers, RelayGroups: relayGroups,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("注入代理节点失败: %w", err)
-	}
-
-	// 6. 注入中转代理组到 proxy-groups
-	if len(relayGroups) > 0 {
-		result, err = injectRelayGroupsIntoTemplate(result, relayGroups)
-		if err != nil {
-			logger.Info("[模板生成] 注入中转代理组失败", "error", err)
-		}
+		return nil, err
 	}
 
 	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", templateFilename, "result_bytes", len(result))

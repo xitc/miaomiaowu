@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -380,7 +381,11 @@ func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficR
 // syncSingleExternalSubscription fetches and syncs nodes from a single external subscription
 // Returns: node count, updated subscription info, error
 func syncSingleExternalSubscription(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
-	key := externalSyncFlightKey(username, sub.ID)
+	inputs, err := json.Marshal([]any{subscribeDir, username, sub.ID, sub.Name, sub.URL, sub.UserAgent, sub.Upload, sub.Download, sub.Total, sub.Expire, sub.TrafficMode, settings})
+	if err != nil {
+		return 0, sub, err
+	}
+	key := fmt.Sprintf("%p:%x", repo, sha256.Sum256(inputs))
 	return doExternalSyncSingleflight(key, func() (int, storage.ExternalSubscription, error) {
 		count, updatedSub, _, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, settings, false)
 		return count, updatedSub, err
