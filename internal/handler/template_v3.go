@@ -238,6 +238,7 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
+		normalizeProxyFields(proxyConfig)
 		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy
 		if node.ChainProxyNodeID != nil {
 			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {

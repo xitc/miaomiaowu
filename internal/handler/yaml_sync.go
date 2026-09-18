@@ -242,29 +242,10 @@ func encodeValue(value any) *yaml.Node {
 	return node
 }
 
-// convertNilToEmptyString recursively converts nil values to empty strings in a map
-func convertNilToEmptyString(m map[string]any) {
-	for k, v := range m {
-		if v == nil {
-			m[k] = ""
-		} else if subMap, ok := v.(map[string]any); ok {
-			convertNilToEmptyString(subMap)
-		} else if slice, ok := v.([]any); ok {
-			for i, item := range slice {
-				if item == nil {
-					slice[i] = ""
-				} else if itemMap, ok := item.(map[string]any); ok {
-					convertNilToEmptyString(itemMap)
-				}
-			}
-		}
-	}
-}
-
 // MarshalYAMLWithQuotedEmptyStrings marshals a map to YAML ensuring empty strings are quoted
 func MarshalYAMLWithQuotedEmptyStrings(data map[string]any) ([]byte, error) {
 	// Convert nil values to empty strings first
-	convertNilToEmptyString(data)
+	normalizeProxyFields(data)
 
 	// Build the root YAML node using our custom encodeValue
 	rootNode := encodeValue(data)
@@ -338,7 +319,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 	}
 
 	// Convert nil values to empty strings (e.g., for short-id field)
-	convertNilToEmptyString(newClashConfig)
+	normalizeProxyFields(newClashConfig)
 
 	// Get all YAML files in subscribes directory
 	entries, err := os.ReadDir(subscribeDir)
@@ -624,7 +605,7 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 		if err := json.Unmarshal([]byte(update.ClashConfigJSON), &clashConfig); err != nil {
 			continue // 跳过无法解析的
 		}
-		convertNilToEmptyString(clashConfig)
+		normalizeProxyFields(clashConfig)
 		parsedUpdates = append(parsedUpdates, parsedUpdate{
 			oldName:     update.OldName,
 			newName:     update.NewName,

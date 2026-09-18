@@ -2392,6 +2392,7 @@ func injectRelayGroups(ctx context.Context, repo *storage.TrafficRepository, use
 				if err := json.Unmarshal([]byte(member.ClashConfig), &pc); err != nil {
 					continue
 				}
+				normalizeProxyFields(pc)
 				pc["name"] = member.NodeName
 				proxiesNode.Content = append(proxiesNode.Content, mapToYAMLNode(pc))
 				existingNames[member.NodeName] = true
@@ -2854,6 +2855,8 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username
 			logger.Info("[模板生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
 			return nil, false
 		}
+		// 规范化容器字段，自愈历史上被写坏的 ws-opts: "" 等值
+		normalizeProxyFields(proxyConfig)
 		// 确保节点名称正确（使用数据库中的名称）
 		proxyConfig["name"] = node.NodeName
 		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy
@@ -3554,6 +3557,7 @@ func (h *SubscriptionHandler) generateFromSelectedTags(ctx context.Context, user
 			logger.Info("[标签动态生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
 			continue
 		}
+		normalizeProxyFields(proxyConfig)
 		proxyConfig["name"] = node.NodeName
 		if node.ChainProxyNodeID != nil {
 			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {

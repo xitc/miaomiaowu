@@ -250,6 +250,10 @@ MIT License
 <details>
 <summary>更新日志</summary>
 
+### v0.8.5 (2026-09-11)
+- 🛠️ fix: sync-version.sh 在 macOS 上同步不了版本号
+- 🛠️ fix: 节点列表复制 URI 时丢掉 AnyTLS 的 REALITY 参数(#116)
+- 🛠️ fix: 支持 AnyTLS + REALITY(#116)
 ### v0.8.3 (2026-07-30)
 - perf: virtualize clash config preview on generator page
 - feat: generator pagination, live aggregate subscriptions

@@ -21,25 +21,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// convertNilToEmptyStringInMap recursively converts nil values to empty strings in a map
-func convertNilToEmptyStringInMap(m map[string]any) {
-	for k, v := range m {
-		if v == nil {
-			m[k] = ""
-		} else if subMap, ok := v.(map[string]any); ok {
-			convertNilToEmptyStringInMap(subMap)
-		} else if slice, ok := v.([]any); ok {
-			for i, item := range slice {
-				if item == nil {
-					slice[i] = ""
-				} else if itemMap, ok := item.(map[string]any); ok {
-					convertNilToEmptyStringInMap(itemMap)
-				}
-			}
-		}
-	}
-}
-
 // safeURLDecode 安全地进行 URL 解码，解码失败时返回原字符串
 func safeURLDecode(s string) string {
 	if s == "" {
@@ -303,6 +284,10 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 规范化容器字段，避免前端提交的 "ws-opts": null/"" 被原样入库
+	req.ClashConfig = normalizeClashConfigJSON(req.ClashConfig)
+	req.ParsedConfig = normalizeClashConfigJSON(req.ParsedConfig)
+
 	logger.Info("[节点创建] 校验通过 - 节点名称, 用户", "node_name", req.NodeName, "user", username)
 
 	var relayGroupNodeIDs []int64
@@ -475,6 +460,10 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 			return
 		}
 	}
+
+	// 规范化容器字段，避免前端提交的 "ws-opts": null/"" 被原样入库
+	req.ClashConfig = normalizeClashConfigJSON(req.ClashConfig)
+	req.ParsedConfig = normalizeClashConfigJSON(req.ParsedConfig)
 
 	logger.Info("[节点更新] 校验通过 - 节点ID, 旧名称, 新名称", "value", id, "param", oldNodeName, "node_name", req.NodeName)
 
@@ -758,6 +747,9 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	oldNodeName := node.NodeName
+
+	// 规范化容器字段，避免 "ws-opts": null/"" 被原样入库
+	req.ClashConfig = normalizeClashConfigJSON(req.ClashConfig)
 
 	// Update node's ClashConfig and ParsedConfig
 	node.ClashConfig = req.ClashConfig
@@ -1395,7 +1387,7 @@ func (h *nodesHandler) handleFetchSubscription(w http.ResponseWriter, r *http.Re
 
 	// Convert nil values to empty strings and decode URL-encoded fields in all proxies
 	for _, proxy := range proxies {
-		convertNilToEmptyStringInMap(proxy)
+		normalizeProxyFields(proxy)
 		decodeProxyURLFields(proxy)
 		if req.ForceNodeSkipCert {
 			proxy["skip-cert-verify"] = true
@@ -1455,7 +1447,7 @@ func (h *nodesHandler) handleParseURIs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, proxy := range proxies {
-		convertNilToEmptyStringInMap(proxy)
+		normalizeProxyFields(proxy)
 		decodeProxyURLFields(proxy)
 		if req.ForceNodeSkipCert {
 			proxy["skip-cert-verify"] = true

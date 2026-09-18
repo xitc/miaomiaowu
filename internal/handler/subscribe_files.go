@@ -1723,6 +1723,7 @@ func buildAggregateConfigContent(ctx context.Context, repo *storage.TrafficRepos
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
+		normalizeProxyFields(proxyConfig)
 		proxyConfig["name"] = node.NodeName
 		proxies = append(proxies, proxyConfig)
 		proxyNames = append(proxyNames, node.NodeName)
@@ -1846,6 +1847,7 @@ func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, user
 			logger.Info("[模板生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
 			continue
 		}
+		normalizeProxyFields(proxyConfig)
 		// 确保节点名称正确（使用数据库中的名称）
 		proxyConfig["name"] = node.NodeName
 		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy

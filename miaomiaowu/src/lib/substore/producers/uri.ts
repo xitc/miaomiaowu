@@ -770,6 +770,20 @@ export default function URI_Producer(): Producer {
                     anytlsParams.push(`fp=${encodeURIComponent(proxy['client-fingerprint'])}`);
                 }
 
+                // REALITY：不带这三个参数，复制出去的链接导入后就退化成普通 AnyTLS。
+                // 与后端 proxyparser 的 encodeAnyTLS 保持一致。
+                if (proxy['reality-opts']) {
+                    anytlsParams.push('security=reality');
+                    const anytlsPbk = proxy['reality-opts']['public-key'];
+                    if (anytlsPbk) {
+                        anytlsParams.push(`pbk=${encodeURIComponent(anytlsPbk)}`);
+                    }
+                    const anytlsSid = proxy['reality-opts']['short-id'];
+                    if (anytlsSid) {
+                        anytlsParams.push(`sid=${encodeURIComponent(anytlsSid)}`);
+                    }
+                }
+
                 // ALPN
                 if (proxy.alpn && Array.isArray(proxy.alpn)) {
                     anytlsParams.push(`alpn=${proxy.alpn.map(encodeURIComponent).join(',')}`);
